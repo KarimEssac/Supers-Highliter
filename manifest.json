@@ -26,7 +26,13 @@
       "48": "highlighter.png"
     }
   },
-"content_scripts": [
+  "web_accessible_resources": [
+    {
+      "resources": ["criteria.png"],
+      "matches": ["https://*.labelbox.com/*"]
+    }
+  ],
+  "content_scripts": [
     {
       "matches": ["https://*.labelbox.com/*"],
       "js": ["network.js"],

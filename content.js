@@ -40,7 +40,7 @@ let selectionDurationMs = -1;
 let transcriptPanelExpanded = false;
 let referenceModal = null;
 let transcriptionCapture = { rowKey: '', before: null, after: null, metrics: null };
-let childFrameTranscript = { rowKey: '', snapshot: null };
+let childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
 let lastSavedTranscriptionSignature = '';
 
 // ── Word Count Widget ─────────────────────────────────────────────────────────
@@ -61,38 +61,80 @@ function normalizeSegmentText(text) {
         .trim();
 }
 
+function isElementVisible(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
 function getCurrentDataRowKey() {
     const match = window.location.pathname.match(/\/projects\/([^/]+)\/data-rows\/([^/?#]+)/);
     if (!match) return window.location.pathname;
     return `${match[1]}/${match[2]}`;
 }
 
-function getTranscriptElements() {
-    let targets = [...document.querySelectorAll('div.vis-item-content')]
-        .filter(el => el.getAttribute('aria-hidden') !== 'true');
-    if (targets.length === 0) {
-        targets = [...document.querySelectorAll('textarea')]
-            .filter(el => el.getAttribute('aria-hidden') !== 'true');
-    }
-    return targets;
+function getSavedTranscriptElements() {
+    return [...document.querySelectorAll('div.vis-item-content')]
+        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el));
 }
 
-function buildTranscriptSnapshot() {
-    const segments = getTranscriptElements()
-        .map(el => normalizeSegmentText(el.value || el.textContent || ''))
-        .filter(text => text.length > 0);
+function getLiveTranscriptTextareas() {
+    return [...document.querySelectorAll('textarea')]
+        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el));
+}
 
-    if (segments.length === 0) return null;
+function buildSnapshotFromSegments(segments) {
+    const cleanSegments = segments
+        .map(segment => normalizeSegmentText(segment))
+        .filter(segment => segment.length > 0);
 
-    const text = segments.join('\n');
+    if (cleanSegments.length === 0) return null;
+
+    const text = cleanSegments.join('\n');
     return {
-        segments,
+        segments: cleanSegments,
         text,
-        segmentCount: segments.length,
+        segmentCount: cleanSegments.length,
         wordCount: countWordsInText(text),
         charCount: text.length,
-        signature: segments.join('\n\u241e')
+        signature: cleanSegments.join('\n\u241e')
     };
+}
+
+function buildSavedTranscriptSnapshot() {
+    const savedElements = getSavedTranscriptElements();
+    return buildSnapshotFromSegments(savedElements.map(el => el.textContent || ''));
+}
+
+function buildLiveTranscriptSnapshot() {
+    const savedElements = getSavedTranscriptElements();
+    const savedSegments = savedElements.map(el => el.textContent || '');
+    const liveTextareas = getLiveTranscriptTextareas();
+
+    if (savedSegments.length > 0) {
+        const mergedSegments = savedSegments.map(segment => normalizeSegmentText(segment));
+        if (liveTextareas.length > 0) {
+            const liveTextarea = liveTextareas.find(el => el === document.activeElement) || liveTextareas[0];
+            const liveText = normalizeSegmentText(liveTextarea.value || '');
+            const selectedContent = document.querySelector('.vis-item.vis-selected div.vis-item-content')
+                || document.querySelector('.vis-item.vis-selected [aria-hidden="false"].vis-item-content')
+                || document.querySelector('.vis-item.vis-selected .vis-item-content');
+            const selectedIndex = selectedContent ? savedElements.indexOf(selectedContent) : -1;
+
+            if (liveText) {
+                if (selectedIndex >= 0) {
+                    mergedSegments[selectedIndex] = liveText;
+                } else if (mergedSegments.length === 1) {
+                    mergedSegments[0] = liveText;
+                }
+            }
+        }
+        return buildSnapshotFromSegments(mergedSegments);
+    }
+
+    return buildSnapshotFromSegments(liveTextareas.map(el => el.value || ''));
 }
 
 function getTranscriptTokens(text, preserveCase = false) {
@@ -147,7 +189,7 @@ function computeTranscriptionMetrics(beforeSnapshot, afterSnapshot) {
         finalWordCount: afterWordTokens.length,
         wordChanges,
         formattingChanges,
-        wordAccuracyPct: toAccuracyPct(baseWordCount, wordChanges),
+        totalAccuracyPct: toAccuracyPct(baseWordCount, exactChanges),
         formatAccuracyPct: toAccuracyPct(baseWordCount, formattingChanges)
     };
 }
@@ -164,10 +206,7 @@ function cloneTranscriptSnapshot(snapshot) {
     };
 }
 
-function getPreferredTranscriptSnapshot() {
-    const localSnapshot = buildTranscriptSnapshot();
-    const childSnapshot = childFrameTranscript.snapshot;
-
+function choosePreferredSnapshot(localSnapshot, childSnapshot) {
     if (!localSnapshot) return childSnapshot ? cloneTranscriptSnapshot(childSnapshot) : null;
     if (!childSnapshot) return localSnapshot;
 
@@ -180,25 +219,33 @@ function getPreferredTranscriptSnapshot() {
     return localSnapshot;
 }
 
+function getPreferredSavedTranscriptSnapshot() {
+    return choosePreferredSnapshot(buildSavedTranscriptSnapshot(), childFrameTranscript.savedSnapshot);
+}
+
+function getPreferredLiveTranscriptSnapshot() {
+    return choosePreferredSnapshot(buildLiveTranscriptSnapshot(), childFrameTranscript.liveSnapshot);
+}
+
 function persistTranscriptionCapture() {
     if (!isTopFrame()) return;
 
-    const payload = transcriptionCapture.before && transcriptionCapture.after
+    const payload = transcriptionCapture.before || transcriptionCapture.after
         ? {
             rowKey: transcriptionCapture.rowKey,
-            before: {
+            before: transcriptionCapture.before ? {
                 segments: [...transcriptionCapture.before.segments],
                 text: transcriptionCapture.before.text,
                 segmentCount: transcriptionCapture.before.segmentCount,
                 wordCount: transcriptionCapture.before.wordCount
-            },
-            after: {
+            } : null,
+            after: transcriptionCapture.after ? {
                 segments: [...transcriptionCapture.after.segments],
                 text: transcriptionCapture.after.text,
                 segmentCount: transcriptionCapture.after.segmentCount,
                 wordCount: transcriptionCapture.after.wordCount
-            },
-            metrics: { ...transcriptionCapture.metrics }
+            } : null,
+            metrics: transcriptionCapture.metrics ? { ...transcriptionCapture.metrics } : null
         }
         : null;
 
@@ -213,25 +260,26 @@ function updateTranscriptionCapture() {
     const rowKey = getCurrentDataRowKey();
     if (transcriptionCapture.rowKey !== rowKey) {
         transcriptionCapture = { rowKey, before: null, after: null, metrics: null };
-        childFrameTranscript = { rowKey: '', snapshot: null };
+        childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
         lastSavedTranscriptionSignature = '';
     }
 
-    const snapshot = getPreferredTranscriptSnapshot();
-    if (!snapshot) {
+    const beforeSnapshot = getPreferredSavedTranscriptSnapshot();
+    const afterSnapshot = getPreferredLiveTranscriptSnapshot() || beforeSnapshot;
+
+    if (!beforeSnapshot && !afterSnapshot) {
         persistTranscriptionCapture();
         return;
     }
 
-    if (!transcriptionCapture.before) {
-        transcriptionCapture.before = cloneTranscriptSnapshot(snapshot);
+    if (!transcriptionCapture.before && beforeSnapshot) {
+        transcriptionCapture.before = cloneTranscriptSnapshot(beforeSnapshot);
     }
 
-    transcriptionCapture.after = cloneTranscriptSnapshot(snapshot);
-    transcriptionCapture.metrics = computeTranscriptionMetrics(
-        transcriptionCapture.before,
-        transcriptionCapture.after
-    );
+    transcriptionCapture.after = afterSnapshot ? cloneTranscriptSnapshot(afterSnapshot) : null;
+    transcriptionCapture.metrics = transcriptionCapture.before && transcriptionCapture.after
+        ? computeTranscriptionMetrics(transcriptionCapture.before, transcriptionCapture.after)
+        : null;
 
     persistTranscriptionCapture();
 }
@@ -536,6 +584,13 @@ function ensureReferenceModal() {
         e.stopPropagation();
     });
     referenceModal.addEventListener('click', e => {
+        const actionEl = e.target.closest('[data-lbh-action="close-reference"]');
+        if (actionEl) {
+            e.preventDefault();
+            e.stopPropagation();
+            closeReferenceModal();
+            return;
+        }
         if (e.target === referenceModal) {
             closeReferenceModal();
             return;
@@ -581,7 +636,7 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionDurationMs > 0) {
+        if (selectionDurationMs >= 0) {
             const pct = (selectionDurationMs / totalMs * 100).toFixed(1);
             html +=
                 dot +
@@ -602,10 +657,11 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
         html +=
             '<br>' +
             '<span style="color:#e5e7eb;margin-right:4px;">Acc</span>' +
-            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.wordAccuracyPct.toFixed(1)}%</span>` +
+            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
             dot +
             '<span style="color:#e5e7eb;margin-right:4px;">Fmt</span>' +
-            `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>`;
+            `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>` +
+            '<br><span style="color:#94a3b8;font-size:12px;">Format errors also reduce total accuracy.</span>';
     }
 
     html +=
@@ -639,7 +695,7 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionDurationMs > 0) {
+        if (selectionDurationMs >= 0) {
             const pct = (selectionDurationMs / totalMs * 100).toFixed(1);
             html +=
                 dot +
@@ -660,10 +716,11 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
         html +=
             '<br>' +
             '<span style="color:#e5e7eb;margin-right:4px;">Acc</span>' +
-            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.wordAccuracyPct.toFixed(1)}%</span>` +
+            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
             dot +
             '<span style="color:#e5e7eb;margin-right:4px;" title="Capitalization and other non-word formatting edits">Format</span>' +
-            `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>`;
+            `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>` +
+            '<br><span style="color:#94a3b8;font-size:12px;">Format errors also reduce total accuracy.</span>';
     }
 
     html +=
@@ -721,7 +778,12 @@ function updateWordCount() {
                 '*'
             );
             window.parent.postMessage(
-                { type: 'LBH_TRANSCRIPTION_STATE', rowKey: getCurrentDataRowKey(), snapshot: buildTranscriptSnapshot() },
+                {
+                    type: 'LBH_TRANSCRIPTION_STATE',
+                    rowKey: getCurrentDataRowKey(),
+                    savedSnapshot: buildSavedTranscriptSnapshot(),
+                    liveSnapshot: buildLiveTranscriptSnapshot()
+                },
                 '*'
             );
             const ttMs = extractTtMsFromTimestamps();
@@ -742,7 +804,8 @@ if (isTopFrame()) {
         } else if (e.data.type === 'LBH_TRANSCRIPTION_STATE') {
             childFrameTranscript = {
                 rowKey: e.data.rowKey || '',
-                snapshot: e.data.snapshot ? cloneTranscriptSnapshot(e.data.snapshot) : null
+                savedSnapshot: e.data.savedSnapshot ? cloneTranscriptSnapshot(e.data.savedSnapshot) : null,
+                liveSnapshot: e.data.liveSnapshot ? cloneTranscriptSnapshot(e.data.liveSnapshot) : null
             };
             updateTranscriptionCapture();
             if (settings.enabled) scheduleCheck();
@@ -1651,7 +1714,7 @@ document.addEventListener('keydown', e => {
 if (!isTopFrame()) {
     try {
         window.parent.postMessage({ type: 'LBH_WORD_COUNT', words: 0, segments: 0, totalMs: 0 }, '*');
-        window.parent.postMessage({ type: 'LBH_TRANSCRIPTION_STATE', rowKey: getCurrentDataRowKey(), snapshot: null }, '*');
+        window.parent.postMessage({ type: 'LBH_TRANSCRIPTION_STATE', rowKey: getCurrentDataRowKey(), savedSnapshot: null, liveSnapshot: null }, '*');
         const ttMs = extractTtMsFromTimestamps();
         if (ttMs >= 0) {
             window.parent.postMessage({ type: 'LBH_TT_MS', ttMs }, '*');
