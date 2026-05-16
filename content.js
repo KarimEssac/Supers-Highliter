@@ -1636,47 +1636,44 @@ function startDomObserver() {
 // Child frames track clicks and report selection up; top frame owns the state.
 let _selectionAnchorFraction = -1;
 
+function publishSelectionDuration(durationMs) {
+    if (isTopFrame()) {
+        selectionDurationMs = durationMs;
+        scheduleCheck();
+    } else {
+        try { window.parent.postMessage({ type: 'LBH_SELECTION', durationMs }, '*'); } catch (_) {}
+    }
+}
+
 document.addEventListener('click', e => {
     const container = getTimelineContainer();
     if (!container) return;
 
     const rect = container.getBoundingClientRect();
-    const inTimeline = e.clientX >= rect.left && e.clientX <= rect.right;
+    const edgeTolerancePx = 8;
+    const inTimeline = e.clientX >= rect.left - edgeTolerancePx && e.clientX <= rect.right + edgeTolerancePx;
 
     if (!inTimeline) {
         if (!e.shiftKey) {
             _selectionAnchorFraction = -1;
-            if (isTopFrame()) {
-                selectionDurationMs = -1;
-                scheduleCheck();
-            } else {
-                try { window.parent.postMessage({ type: 'LBH_SELECTION', durationMs: -1 }, '*'); } catch (_) {}
-            }
+            publishSelectionDuration(-1);
         }
         return;
     }
 
-    const fraction = (e.clientX - rect.left) / rect.width;
+    const rawFraction = (e.clientX - rect.left) / rect.width;
+    const fraction = Math.max(0, Math.min(1, rawFraction));
 
-    if (e.shiftKey && _selectionAnchorFraction >= 0) {
+    if (e.shiftKey) {
+        const anchorFraction = _selectionAnchorFraction >= 0 ? _selectionAnchorFraction : 0;
         const totalMediaMs = getTotalMediaMs();
         if (totalMediaMs > 0) {
-            const durationMs = Math.abs(fraction - _selectionAnchorFraction) * totalMediaMs;
-            if (isTopFrame()) {
-                selectionDurationMs = durationMs;
-                scheduleCheck();
-            } else {
-                try { window.parent.postMessage({ type: 'LBH_SELECTION', durationMs }, '*'); } catch (_) {}
-            }
+            const durationMs = Math.abs(fraction - anchorFraction) * totalMediaMs;
+            publishSelectionDuration(durationMs);
         }
     } else if (!e.shiftKey) {
         _selectionAnchorFraction = fraction;
-        if (isTopFrame()) {
-            selectionDurationMs = -1;
-            scheduleCheck();
-        } else {
-            try { window.parent.postMessage({ type: 'LBH_SELECTION', durationMs: -1 }, '*'); } catch (_) {}
-        }
+        publishSelectionDuration(-1);
     }
 });
 
