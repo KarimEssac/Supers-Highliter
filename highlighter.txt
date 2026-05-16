@@ -1,0 +1,203 @@
+  function getToken()  { return PropertiesService.getScriptProperties().getProperty('GITHUB_TOKEN'); }
+  function getGistId() { return PropertiesService.getScriptProperties().getProperty('GIST_ID'); }
+  function getSheetId() { 
+    // 1. Try Script Properties
+    const id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
+    if (id) return id;
+    
+    // 2. Try Active Spreadsheet (works if script is "bound" to a sheet)
+    try {
+      const active = SpreadsheetApp.getActiveSpreadsheet();
+      if (active) return active.getId();
+    } catch (e) {}
+    
+    // 3. Fallback to your known ID
+    return '1dAYt1dCbw-9JUCjeeDQNYu1oNTjFSzWpifBnRwk7q5M';
+  }
+
+  function doPost(e) {
+    try {
+      let contents = e.postData.contents;
+      if (!contents) throw new Error("No post data received");
+      
+      // Some browsers might send it as a string even if it's text/plain
+      let body;
+      try {
+        body = JSON.parse(contents);
+      } catch (e) {
+        throw new Error("Failed to parse JSON: " + contents);
+      }
+
+      const gistId = getGistId();
+      if (!gistId) throw new Error("GIST_ID not set in Script Properties");
+      
+      const ssId = getSheetId();
+      if (!ssId) throw new Error("SHEET_ID not set and no active spreadsheet found");
+      
+      const ss = SpreadsheetApp.openById(ssId);
+      let sheet = ss.getSheetByName('SR Flags');
+      if (!sheet) {
+        sheet = ss.insertSheet('SR Flags');
+        sheet.appendRow(['SR Flag ID', 'Count', 'Comments']);
+        sheet.getRange(1, 1, 1, 3).setFontWeight('bold').setBackground('#4A90D9').setFontColor('#FFFFFF');
+      }
+
+      // ── SR flag action: upsert in sheet, update gist ──
+      if (body.action === 'flag') {
+        const id = String(body.id || '').trim();
+        if (!id) throw new Error("No ID provided for flag action");
+        
+        const comment = String(body.comment || '').trim();
+        const data = sheet.getDataRange().getValues();
+        let found = false;
+        let count = 1;
+
+        for (let i = 1; i < data.length; i++) {
+          if (String(data[i][0]) === id) {
+            count = (Number(data[i][1]) || 0) + 1;
+            sheet.getRange(i + 1, 2).setValue(count);
+            
+            if (comment) {
+              let existingComments = String(data[i][2] || '').trim();
+              let newComments = existingComments ? existingComments + '\n' + comment : comment;
+              sheet.getRange(i + 1, 3).setValue(newComments);
+            }
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          sheet.appendRow([id, 1, comment]);
+        }
+
+        // Re-sync Gist with unique IDs from sheet for highlighting
+        updateGistSrFlags(gistId, sheet);
+
+        return ContentService.createTextOutput(JSON.stringify({ ok: true, count: count }))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // ── TL save action: update all lists in gist ──
+      const current = fetchGist(gistId);
+      const filename = Object.keys(current.files)[0];
+      const lists = JSON.parse(current.files[filename].content);
+
+      // SAFETY GUARD: Prevent race-condition resets
+      // If the incoming payload has significantly fewer items than the current Gist,
+      // it's likely a corrupted/empty state from the extension.
+      const currentTotal = (lists.removed || []).length + (lists.communityAudit || []).length + (lists.srFlag || []).length;
+      const incomingTotal = (Array.isArray(body.removed) ? body.removed.length : (lists.removed || []).length) +
+                            (Array.isArray(body.communityAudit) ? body.communityAudit.length : (lists.communityAudit || []).length) +
+                            (Array.isArray(body.srFlag) ? body.srFlag.length : (lists.srFlag || []).length);
+
+      if (currentTotal > 10 && incomingTotal < (currentTotal - 5)) {
+        throw new Error(`Safety Guard: Prevented possible Gist reset (Current: ${currentTotal}, Incoming: ${incomingTotal}). Please refresh the extension and try again.`);
+      }
+
+      if (Array.isArray(body.removed))        lists.removed        = body.removed;
+      if (Array.isArray(body.communityAudit)) lists.communityAudit = body.communityAudit;
+      
+      // If srFlag is provided, it means a TL modified the flagging list (e.g. deleted an ID)
+      if (Array.isArray(body.srFlag)) {
+        const newSrFlagList = body.srFlag.map(String);
+        
+        // Update the Gist lists (both the simple ID list and the detailed object)
+        lists.srFlag = newSrFlagList;
+        if (!lists.srFlagDetails) lists.srFlagDetails = {};
+        
+        // Remove deleted IDs from srFlagDetails
+        const currentDetailsIds = Object.keys(lists.srFlagDetails);
+        currentDetailsIds.forEach(id => {
+          if (!newSrFlagList.includes(id)) {
+            delete lists.srFlagDetails[id];
+          }
+        });
+
+        // Sync changes back to the Spreadsheet: delete rows that are no longer in srFlag
+        const lastRow = sheet.getLastRow();
+        if (lastRow >= 2) {
+          const data = sheet.getRange(1, 1, lastRow, 1).getValues();
+          // Start from bottom to avoid index shifts when deleting
+          for (let i = data.length - 1; i >= 1; i--) {
+            const sheetId = String(data[i][0]).trim();
+            if (sheetId && !newSrFlagList.includes(sheetId)) {
+              sheet.deleteRow(i + 1);
+            }
+          }
+        }
+      }
+
+      patchGist(gistId, filename, lists);
+
+      return ContentService.createTextOutput(JSON.stringify({ ok: true }))
+        .setMimeType(ContentService.MimeType.JSON);
+
+    } catch (err) {
+      console.error("Super Highlighter Error:", err.message);
+      return ContentService.createTextOutput(JSON.stringify({ ok: false, error: err.message }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+
+  function fetchGist(gistId) {
+    const token = getToken();
+    if (!token) throw new Error("GITHUB_TOKEN not set in Script Properties");
+    
+    const response = UrlFetchApp.fetch(`https://api.github.com/gists/${gistId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() !== 200) {
+      throw new Error("GitHub API Error: " + response.getContentText());
+    }
+    
+    return JSON.parse(response.getContentText());
+  }
+
+  function patchGist(gistId, filename, content) {
+    const token = getToken();
+    const response = UrlFetchApp.fetch(`https://api.github.com/gists/${gistId}`, {
+      method: 'patch',
+      headers: { 
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify({ files: { [filename]: { content: JSON.stringify(content, null, 2) } } }),
+      muteHttpExceptions: true
+    });
+    
+    if (response.getResponseCode() !== 200) {
+      throw new Error("GitHub Patch Error: " + response.getContentText());
+    }
+  }
+
+  function updateGistSrFlags(gistId, sheet) {
+    const current = fetchGist(gistId);
+    const filename = Object.keys(current.files)[0];
+    const lists = JSON.parse(current.files[filename].content);
+    
+    const lastRow = sheet.getLastRow();
+    const uniqueIds = [];
+    const details = {};
+
+    if (lastRow >= 2) {
+      const data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+      data.forEach(row => {
+        const id = String(row[0]).trim();
+        if (id) {
+          uniqueIds.push(id);
+          details[id] = {
+            count: row[1],
+            comments: row[2]
+          };
+        }
+      });
+    }
+
+    lists.srFlag = uniqueIds;
+    lists.srFlagDetails = details;
+    
+    patchGist(gistId, filename, lists);
+  }

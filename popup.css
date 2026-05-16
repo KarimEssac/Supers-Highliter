@@ -1,0 +1,373 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: #0f1115;
+  color: #ffffff;
+}
+
+.nav-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #2a3240;
+  padding-bottom: 8px;
+}
+
+.nav-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.nav-tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.nav-tab {
+  background: none;
+  border: 1px solid transparent;
+  color: #e5e7eb;
+  padding: 6px 12px;
+  font-size: 13px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.nav-tab:hover {
+  background: #1e2736;
+  color: #ffffff;
+}
+
+.nav-tab.active {
+  background: #1e2736;
+  border-color: #3b82f6;
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.view {
+  display: block;
+}
+
+.view.hidden {
+  display: none;
+}
+
+.panel {
+  width: 400px;
+  padding: 16px;
+  box-sizing: border-box;
+  min-height: 480px; /* Prevent jumpy height during nav */
+}
+
+h1 {
+  margin: 0 0 10px;
+  font-size: 18px;
+}
+
+.group {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #2a3240;
+  border-radius: 6px;
+  background: #161b22;
+}
+
+label {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox {
+  margin-bottom: 10px;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  box-sizing: border-box;
+  border: 1px solid #344154;
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 14px;
+  color: #ffffff;
+  background: #0f141c;
+}
+
+.actions {
+  margin-top: 16px;
+  justify-content: space-between;
+}
+
+button {
+  border: 1px solid #3b82f6;
+  background: #3b82f6;
+  color: #ffffff;
+  border-radius: 4px;
+  font-size: 14px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #2563eb;
+}
+
+#status {
+  font-size: 14px;
+  color: #34d399;
+}
+
+/* ── Community Lists ─────────────────────────────────────────────────────── */
+
+.remote-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.remote-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#undo-btn {
+  border-color: #344154;
+  background: #1e2736;
+  color: #e5e7eb;
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+#undo-btn:hover:not(:disabled) {
+  background: #2a3240;
+  color: #ffffff;
+  border-color: #4b5563;
+}
+
+#undo-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.remote-status {
+  font-size: 13px;
+  color: #e5e7eb;
+}
+
+.list-panel {
+  border: 1px solid #2a3240;
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.list-panel--pink   { border-left-color: #f472b6; }
+.list-panel--purple { border-left-color: #a855f7; }
+.list-panel--blue   { border-left-color: #3b82f6; }
+.list-panel--teal   { border-left-color: #2dd4bf; }
+
+.list-panel-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+
+.list-panel--pink .list-panel-title   { color: #f472b6; }
+.list-panel--purple .list-panel-title { color: #a855f7; }
+.list-panel--blue .list-panel-title   { color: #3b82f6; }
+.list-panel--teal .list-panel-title   { color: #2dd4bf; }
+
+.config-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #94a3b8;
+  margin-bottom: 10px;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+
+.status-dot--pink { background-color: #f472b6; }
+.status-dot--purple { background-color: #a855f7; }
+
+.chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 20px;
+  margin-bottom: 8px;
+}
+
+.chip-empty, .chip-summary {
+  font-size: 13px;
+  color: #e5e7eb;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 13px;
+  background: #1e2736;
+  border: 1px solid #344154;
+  max-width: 250px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-remove {
+  background: none;
+  border: none;
+  color: #e5e7eb;
+  cursor: pointer;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.chip-remove:hover {
+  color: #ffffff;
+  background: none;
+}
+
+.add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#srflag-paste-btn {
+  background: #1e2736;
+  border-color: #344154;
+  color: #e5e7eb;
+}
+
+#srflag-paste-btn:hover {
+  background: #2a3240;
+  color: #ffffff;
+  border-color: #4b5563;
+}
+
+.add-row input {
+  flex: 1;
+  border: 1px solid #344154;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 14px;
+  color: #ffffff;
+  background: #0f141c;
+  min-width: 0;
+}
+
+.hidden { display: none !important; }
+
+.tl-password-row {
+  margin-bottom: 16px;
+  padding: 10px;
+  background: #1e2736;
+  border-radius: 4px;
+  border: 1px solid #344154;
+}
+
+.tl-password-row label {
+  font-size: 13px;
+  color: #e5e7eb;
+  margin-bottom: 6px;
+}
+
+.tl-password-row input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #344154;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 14px;
+  color: #ffffff;
+  background: #0f141c;
+}
+
+/* ── Remote Settings (collapsible) ───────────────────────────────────────── */
+
+.remote-settings {
+  margin-top: 10px;
+}
+
+.remote-settings summary {
+  font-size: 14px;
+  color: #ffffff;
+  cursor: pointer;
+  list-style: none;
+  padding: 4px 0;
+}
+
+.remote-settings summary::-webkit-details-marker { display: none; }
+.remote-settings summary::before { content: '▸ '; }
+.remote-settings[open] summary::before { content: '▾ '; }
+
+.remote-settings[open] summary {
+  margin-bottom: 10px;
+}
+
+.remote-settings input[type="text"],
+.remote-settings input[type="password"] {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #344154;
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 14px;
+  color: #ffffff;
+  background: #0f141c;
+  margin-bottom: 0;
+}
+
+.remote-settings label {
+  margin-top: 8px;
+  margin-bottom: 6px;
+}
+
+.label-hint {
+  color: #e5e7eb;
+  font-weight: normal;
+}
+
+.remote-actions {
+  margin-top: 12px;
+}
+
+.remote-actions #remote-save-status {
+  font-size: 14px;
+  color: #34d399;
+}

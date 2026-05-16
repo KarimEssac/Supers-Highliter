@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Super Highlighter",
+  "version": "1.1",
+  "description": "Highlights configured words/symbols with community-managed lists and Labelbox tab utilities",
+  "icons": {
+    "48": "highlighter.png",
+    "128": "highlighter.png"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "lbx-highlighter@local",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": ["storage", "unlimitedStorage", "tabs", "clipboardRead", "clipboardWrite"],
+  "host_permissions": ["https://api.github.com/*", "https://script.google.com/*", "https://drive.usercontent.google.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "highlighter.png"
+    }
+  },
+"content_scripts": [
+    {
+      "matches": ["https://*.labelbox.com/*"],
+      "js": ["network.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*.labelbox.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

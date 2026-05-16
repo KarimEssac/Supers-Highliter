@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Super Highlighter</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="panel">
+    <header class="nav-header">
+      <h1 class="nav-title">Super Highlighter</h1>
+      <nav class="nav-tabs">
+        <button id="nav-reports" class="nav-tab active" type="button">Tools</button>
+        <button id="nav-lists" class="nav-tab" type="button">Lists</button>
+        <button id="nav-config" class="nav-tab" type="button">Config</button>
+      </nav>
+    </header>
+
+    <!-- ── Reports ─────────────────────────────────────────────────── -->
+    <div id="view-reports" class="view">
+      <div class="list-panel list-panel--blue" style="margin-top: 4px;">
+        <div class="list-panel-title">Flagging <span id="flag-status" class="remote-status" style="margin-left:8px; font-weight:normal; text-transform:none;"></span></div>
+        <div id="srflag-list" class="chip-list"></div>
+        <div id="srflag-add-row" class="add-row hidden" style="flex-direction: column; align-items: stretch; gap: 8px;">
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input id="srflag-input" type="text" placeholder="Masked ID..." spellcheck="false" style="flex: 1;" />
+            <button id="srflag-paste-btn" type="button" title="Paste from clipboard" style="width: 70px; padding: 8px 0; text-align: center;">Paste</button>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: stretch;">
+            <textarea id="srflag-comment" placeholder="Comment..." spellcheck="false" style="flex: 1; font-size: 14px; padding: 6px 8px; height: 44px; min-height: 44px;"></textarea>
+            <button id="srflag-add-btn" type="button" style="width: 70px; padding: 8px 0; text-align: center;">Flag</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="gk-lookup-panel" class="list-panel list-panel--teal hidden" style="margin-top: 4px;">
+        <div class="list-panel-title">GK / DR Lookup <span id="gk-status" class="remote-status" style="margin-left:8px; font-weight:normal; text-transform:none;"></span></div>
+        <div class="add-row" style="margin-bottom: 6px;">
+          <input id="gk-input" type="text" placeholder="Paste GK or DR id…" spellcheck="false" style="flex: 1;" />
+          <button id="gk-paste-btn" type="button" style="width: 70px; padding: 8px 0; text-align: center;">Paste</button>
+        </div>
+        <button id="gk-go-btn" type="button" style="width: 100%; padding: 8px 0;">Open in Labelbox</button>
+      </div>
+    </div>
+
+    <!-- ── Lists ───────────────────────────────────────────────────── -->
+    <div id="view-lists" class="view hidden">
+      <section class="group">
+        <div class="remote-header">
+          <span>Community Lists</span>
+          <div class="remote-header-actions">
+            <button id="undo-btn" type="button" disabled>Undo</button>
+            <span id="remote-status" class="remote-status"></span>
+          </div>
+        </div>
+
+        <div id="tl-password-container" class="tl-password-row">
+          <label for="tl-password">Password</label>
+          <input id="tl-password" type="password" placeholder="Enter password to edit lists..." />
+        </div>
+
+        <div class="list-panel list-panel--pink">
+          <div class="list-panel-title">Removed</div>
+          <div id="removed-list" class="chip-list"></div>
+          <div id="removed-add-row" class="add-row hidden">
+            <input id="removed-input" type="text" placeholder="Add string..." spellcheck="false" />
+            <button id="removed-add-btn" type="button">Add</button>
+          </div>
+        </div>
+
+        <div class="list-panel list-panel--purple">
+          <div class="list-panel-title">Community Audit</div>
+          <div id="audit-list" class="chip-list"></div>
+          <div id="audit-add-row" class="add-row hidden">
+            <input id="audit-input" type="text" placeholder="Add string..." spellcheck="false" />
+            <button id="audit-add-btn" type="button">Add</button>
+          </div>
+        </div>
+      </section>
+
+      <details class="group remote-settings">
+        <summary>Remote Settings</summary>
+        <label for="gist-id">Gist ID or URL</label>
+        <input id="gist-id" type="text" placeholder="https://gist.github.com/user/..." spellcheck="false" />
+        <label for="write-url">Write URL <span class="label-hint">(Apps Script endpoint)</span></label>
+        <input id="write-url" type="text" placeholder="https://script.google.com/macros/s/..." spellcheck="false" />
+        <label for="drive-file-id" style="margin-top:8px;">Drive File ID <span class="label-hint">(GK batch data)</span></label>
+        <input id="drive-file-id" type="text" placeholder="Google Drive file ID..." spellcheck="false" />
+        <div class="row actions remote-actions" style="flex-wrap: wrap; gap: 8px;">
+          <button id="remote-save" type="button">Save</button>
+          <button id="drive-refresh-btn" type="button" style="background:#1e2736; border-color:#344154; color:#e5e7eb;">Refresh (new batch)</button>
+          <span id="remote-save-status" aria-live="polite"></span>
+        </div>
+        <span id="drive-status" class="remote-status" style="font-size:12px; display:block; margin-top:6px;"></span>
+      </details>
+    </div>
+
+    <!-- ── Config ──────────────────────────────────────────────────── -->
+    <div id="view-config" class="view hidden">
+      <section class="group">
+        <div class="config-section-title">Tab Manager</div>
+        <label class="row checkbox">
+          <input id="enableGKLookup" type="checkbox" />
+          <span>Enable GK Lookup panel</span>
+        </label>
+        <label class="row checkbox">
+          <input id="enableTabDedup" type="checkbox" />
+          <span>Enable tab deduplication</span>
+        </label>
+      </section>
+
+      <section class="group">
+        <div class="config-section-title">Highlighter</div>
+        <label class="row checkbox">
+          <input id="enableCaseInsensitiveWords" type="checkbox" />
+          <span>Enable case-insensitive words</span>
+        </label>
+        <label for="wordsToHighlight" style="margin-top:4px;">Case-insensitive words (comma-separated)</label>
+        <textarea id="wordsToHighlight" rows="3" spellcheck="false"></textarea>
+        <label class="row checkbox" style="margin-top:10px;">
+          <input id="enableCaseSensitiveWords" type="checkbox" />
+          <span>Enable case-sensitive words</span>
+        </label>
+        <label for="wordsToHighlightCaseSensitive" style="margin-top:4px;">Case-sensitive words (comma-separated)</label>
+        <textarea id="wordsToHighlightCaseSensitive" rows="3" spellcheck="false"></textarea>
+        <label class="row checkbox" style="margin-top:10px;">
+          <input id="enablePunctuation" type="checkbox" />
+          <span>Enable punctuation highlighting</span>
+        </label>
+        <label class="row checkbox">
+          <input id="enableOrangeAngle" type="checkbox" />
+          <span>Enable orange &lt;...&gt; highlighting</span>
+        </label>
+      </section>
+
+      <div class="row actions">
+        <button id="save" type="button">Save</button>
+        <span id="status" aria-live="polite"></span>
+      </div>
+    </div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
