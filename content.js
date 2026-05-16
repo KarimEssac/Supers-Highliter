@@ -85,6 +85,13 @@ function getLiveTranscriptTextareas() {
         .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el));
 }
 
+function getActiveTranscriptTextarea() {
+    const active = document.activeElement;
+    if (!active || !active.matches || !active.matches('textarea')) return null;
+    if (active.getAttribute('aria-hidden') === 'true' || !isElementVisible(active)) return null;
+    return active;
+}
+
 function buildSnapshotFromSegments(segments) {
     const cleanSegments = segments
         .map(segment => normalizeSegmentText(segment))
@@ -111,19 +118,23 @@ function buildSavedTranscriptSnapshot() {
 function buildLiveTranscriptSnapshot() {
     const savedElements = getSavedTranscriptElements();
     const savedSegments = savedElements.map(el => el.textContent || '');
-    const liveTextareas = getLiveTranscriptTextareas();
+    const activeTextarea = getActiveTranscriptTextarea();
 
     if (savedSegments.length > 0) {
         const mergedSegments = savedSegments.map(segment => normalizeSegmentText(segment));
-        if (liveTextareas.length > 0) {
-            const liveTextarea = liveTextareas.find(el => el === document.activeElement) || liveTextareas[0];
-            const liveText = normalizeSegmentText(liveTextarea.value || '');
+        if (activeTextarea) {
+            const liveText = normalizeSegmentText(activeTextarea.value || '');
             const selectedContent = document.querySelector('.vis-item.vis-selected div.vis-item-content')
                 || document.querySelector('.vis-item.vis-selected [aria-hidden="false"].vis-item-content')
                 || document.querySelector('.vis-item.vis-selected .vis-item-content');
             const selectedIndex = selectedContent ? savedElements.indexOf(selectedContent) : -1;
 
             if (liveText) {
+                const savedText = selectedIndex >= 0 ? normalizeSegmentText(mergedSegments[selectedIndex]) : '';
+                const looksLikeEditorPlaceholder = /^\d{1,2}$/.test(liveText) && savedText && savedText !== liveText;
+                if (looksLikeEditorPlaceholder) {
+                    return buildSnapshotFromSegments(mergedSegments);
+                }
                 if (selectedIndex >= 0) {
                     mergedSegments[selectedIndex] = liveText;
                 } else if (mergedSegments.length === 1) {
@@ -134,7 +145,10 @@ function buildLiveTranscriptSnapshot() {
         return buildSnapshotFromSegments(mergedSegments);
     }
 
-    return buildSnapshotFromSegments(liveTextareas.map(el => el.value || ''));
+    if (!activeTextarea) return null;
+    const activeText = normalizeSegmentText(activeTextarea.value || '');
+    if (/^\d{1,2}$/.test(activeText)) return null;
+    return buildSnapshotFromSegments([activeText]);
 }
 
 function getTranscriptTokens(text, preserveCase = false) {
@@ -547,20 +561,132 @@ function extractTtMsFromTimestamps() {
     return found ? totalMs : -1;
 }
 
-function renderTranscriptSection(label, text, accentColor) {
+function renderTranscriptSection(label, text, accentColor, highlightedHtml = '') {
     const hasText = !!text;
+    const bodyHtml = highlightedHtml || (hasText ? escapeHtml(text) : 'Waiting for transcription capture...');
     return (
         `<div data-lbh-nodrag style="margin-top:8px;">` +
             `<div style="color:${accentColor};font-weight:600;margin-bottom:4px;">${label}</div>` +
-            `<div style="background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;word-break:break-word;max-height:140px;overflow:auto;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;">${hasText ? escapeHtml(text) : 'Waiting for transcription capture...'}</div>` +
+            `<div style="background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;word-break:break-word;max-height:140px;overflow:auto;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;">${bodyHtml}</div>` +
         '</div>'
     );
+}
+
+function getTranscriptTokenRanges(text) {
+    const tokens = [];
+    const regex = /[A-Za-z0-9]+(?:['\u2019-][A-Za-z0-9]+)*/g;
+    let match;
+    while ((match = regex.exec(String(text || ''))) !== null) {
+        tokens.push({
+            text: match[0],
+            lower: match[0].toLowerCase(),
+            start: match.index,
+            end: match.index + match[0].length
+        });
+    }
+    return tokens;
+}
+
+function getLowercaseMatchPairs(beforeTokens, afterTokens) {
+    const rows = beforeTokens.length + 1;
+    const cols = afterTokens.length + 1;
+    const dp = Array.from({ length: rows }, () => new Array(cols).fill(0));
+
+    for (let i = beforeTokens.length - 1; i >= 0; i -= 1) {
+        for (let j = afterTokens.length - 1; j >= 0; j -= 1) {
+            if (beforeTokens[i].lower === afterTokens[j].lower) {
+                dp[i][j] = dp[i + 1][j + 1] + 1;
+            } else {
+                dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+            }
+        }
+    }
+
+    const pairs = [];
+    let i = 0;
+    let j = 0;
+    while (i < beforeTokens.length && j < afterTokens.length) {
+        if (beforeTokens[i].lower === afterTokens[j].lower) {
+            pairs.push([i, j]);
+            i += 1;
+            j += 1;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    return pairs;
+}
+
+function buildTranscriptDiffHighlights(beforeText, afterText) {
+    const beforeTokens = getTranscriptTokenRanges(beforeText);
+    const afterTokens = getTranscriptTokenRanges(afterText);
+    const beforeFlags = new Array(beforeTokens.length).fill('');
+    const afterFlags = new Array(afterTokens.length).fill('');
+    const matchedBefore = new Set();
+    const matchedAfter = new Set();
+
+    getLowercaseMatchPairs(beforeTokens, afterTokens).forEach(([beforeIndex, afterIndex]) => {
+        matchedBefore.add(beforeIndex);
+        matchedAfter.add(afterIndex);
+        if (beforeTokens[beforeIndex].text !== afterTokens[afterIndex].text) {
+            beforeFlags[beforeIndex] = 'format';
+            afterFlags[afterIndex] = 'word-after';
+        }
+    });
+
+    beforeTokens.forEach((_, index) => {
+        if (!matchedBefore.has(index)) beforeFlags[index] = 'word-before';
+    });
+    afterTokens.forEach((_, index) => {
+        if (!matchedAfter.has(index)) afterFlags[index] = 'word-after';
+    });
+
+    return {
+        beforeHtml: renderTranscriptWithTokenHighlights(beforeText, beforeTokens, beforeFlags),
+        afterHtml: renderTranscriptWithTokenHighlights(afterText, afterTokens, afterFlags)
+    };
+}
+
+function getTokenHighlightStyle(flag) {
+    if (flag === 'format') return 'background:rgba(245,158,11,0.32);border-radius:2px;';
+    if (flag === 'word-before') return 'background:rgba(239,68,68,0.30);border-radius:2px;';
+    if (flag === 'word-after') return 'background:rgba(34,197,94,0.30);border-radius:2px;';
+    return '';
+}
+
+function renderTranscriptWithTokenHighlights(text, tokens, flags) {
+    let html = '';
+    let cursor = 0;
+    tokens.forEach((token, index) => {
+        html += escapeHtml(String(text || '').slice(cursor, token.start));
+        const style = getTokenHighlightStyle(flags[index]);
+        const tokenHtml = escapeHtml(String(text || '').slice(token.start, token.end));
+        html += style ? `<span style="${style}">${tokenHtml}</span>` : tokenHtml;
+        cursor = token.end;
+    });
+    html += escapeHtml(String(text || '').slice(cursor));
+    return html;
 }
 
 function renderWidgetButton(label, action, isActive = false) {
     const background = isActive ? '#334155' : '#1e293b';
     const border = isActive ? '#60a5fa' : '#475569';
     return `<button data-lbh-nodrag data-lbh-action="${action}" style="background:${background};color:#e5e7eb;border:1px solid ${border};border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer;">${label}</button>`;
+}
+
+function getAccuracyColor(accuracyPct) {
+    const pct = Math.max(0, Math.min(100, Number(accuracyPct) || 0));
+    if (pct >= 95) return '#22c55e';
+    if (pct >= 85) return '#84cc16';
+    if (pct >= 70) return '#f59e0b';
+    if (pct >= 50) return '#f97316';
+    return '#ef4444';
+}
+
+function getAccuracyNoteHtml() {
+    return '<div style="color:#94a3b8;font-size:12px;line-height:1.35;max-width:260px;white-space:normal;overflow-wrap:anywhere;margin:2px auto 0;">Format errors also reduce total accuracy. Missing periods and commas do not.</div>';
 }
 
 function ensureReferenceModal() {
@@ -654,14 +780,15 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
     }
 
     if (transcriptionCapture.metrics) {
+        const accuracyColor = getAccuracyColor(transcriptionCapture.metrics.totalAccuracyPct);
         html +=
             '<br>' +
             '<span style="color:#e5e7eb;margin-right:4px;">Acc</span>' +
-            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
+            `<span style="color:${accuracyColor};font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
             dot +
             '<span style="color:#e5e7eb;margin-right:4px;">Fmt</span>' +
             `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>` +
-            '<br><span style="color:#94a3b8;font-size:12px;">Format errors also reduce total accuracy.</span>';
+            getAccuracyNoteHtml();
     }
 
     html +=
@@ -713,14 +840,15 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
     }
 
     if (transcriptionCapture.metrics) {
+        const accuracyColor = getAccuracyColor(transcriptionCapture.metrics.totalAccuracyPct);
         html +=
             '<br>' +
             '<span style="color:#e5e7eb;margin-right:4px;">Acc</span>' +
-            `<span style="color:#22c55e;font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
+            `<span style="color:${accuracyColor};font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
             dot +
             '<span style="color:#e5e7eb;margin-right:4px;" title="Capitalization and other non-word formatting edits">Format</span>' +
             `<span style="color:#60a5fa;font-weight:600;">${transcriptionCapture.metrics.formatAccuracyPct.toFixed(1)}%</span>` +
-            '<br><span style="color:#94a3b8;font-size:12px;">Format errors also reduce total accuracy.</span>';
+            getAccuracyNoteHtml();
     }
 
     html +=
@@ -729,16 +857,19 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
         '</div>' +
         `<div data-lbh-nodrag style="display:flex;justify-content:${transcriptPanelExpanded ? 'center' : 'flex-start'};gap:8px;flex-wrap:wrap;margin-top:10px;">` +
             renderWidgetButton(transcriptPanelExpanded ? 'Hide Transcript' : 'Show Transcript', 'toggle-transcript', transcriptPanelExpanded) +
-            renderWidgetButton('Reference', 'open-reference') +
+            renderWidgetButton('Rating Criteria', 'open-reference') +
         '</div>';
 
     if (transcriptPanelExpanded) {
+        const beforeText = transcriptionCapture.before ? transcriptionCapture.before.text : '';
+        const afterText = transcriptionCapture.after ? transcriptionCapture.after.text : '';
+        const diffHtml = buildTranscriptDiffHighlights(beforeText, afterText);
         html +=
             '<div data-lbh-nodrag style="margin-top:10px;padding-top:8px;border-top:1px solid #334155;">' +
                 '<div style="color:#cbd5e1;font-weight:700;letter-spacing:0.02em;text-align:center;">Transcription</div>' +
             '</div>' +
-            renderTranscriptSection('Before', transcriptionCapture.before ? transcriptionCapture.before.text : '', '#f59e0b') +
-            renderTranscriptSection('After', transcriptionCapture.after ? transcriptionCapture.after.text : '', '#22c55e');
+            renderTranscriptSection('Before', beforeText, '#f59e0b', diffHtml.beforeHtml) +
+            renderTranscriptSection('After', afterText, '#22c55e', diffHtml.afterHtml);
     }
 
     widget.innerHTML = html;
