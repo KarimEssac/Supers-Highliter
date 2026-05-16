@@ -69,6 +69,12 @@ function isElementVisible(el) {
     return rect.width > 0 && rect.height > 0;
 }
 
+function closestFromEventTarget(target, selector) {
+    if (!target) return null;
+    const element = target.nodeType === Node.ELEMENT_NODE ? target : target.parentElement;
+    return element && element.closest ? element.closest(selector) : null;
+}
+
 function getCurrentDataRowKey() {
     const match = window.location.pathname.match(/\/projects\/([^/]+)\/data-rows\/([^/?#]+)/);
     if (!match) return window.location.pathname;
@@ -420,8 +426,8 @@ function makeDraggable(widget) {
 
     widget.addEventListener('mousedown', e => {
         if (e.button !== 0) return;
-        if (e.target.closest('[data-lbh-close]')) return;
-        if (e.target.closest('[data-lbh-nodrag]')) return;
+        if (closestFromEventTarget(e.target, '[data-lbh-close]')) return;
+        if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) return;
         dragging = true;
         originX = e.clientX;
         originY = e.clientY;
@@ -479,25 +485,30 @@ function ensureWordCountWidget() {
 
     makeDraggable(wordCountWidget);
 
+    wordCountWidget.addEventListener('pointerdown', e => {
+        handleWidgetActionPress(e);
+    }, true);
     wordCountWidget.addEventListener('mousedown', e => {
-        if (e.target.closest('[data-lbh-nodrag]')) {
-            e.stopPropagation();
+        if (handleWidgetActionPress(e)) return;
+
+        if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) {
+            e.stopImmediatePropagation();
         }
-    });
+    }, true);
     wordCountWidget.addEventListener('click', e => {
-        if (e.target.closest('[data-lbh-action]')) {
-            return;
+        if (suppressWidgetActionClick(e)) return;
+        if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) {
+            e.stopImmediatePropagation();
         }
-        if (e.target.closest('[data-lbh-nodrag]')) {
-            e.stopPropagation();
-        }
-    });
+    }, true);
 
     wordCountWidget.addEventListener('mouseover', e => {
-        if (e.target.closest('[data-lbh-close]')) e.target.closest('[data-lbh-close]').style.color = '#ffffff';
+        const closeButton = closestFromEventTarget(e.target, '[data-lbh-close]');
+        if (closeButton) closeButton.style.color = '#ffffff';
     });
     wordCountWidget.addEventListener('mouseout', e => {
-        if (e.target.closest('[data-lbh-close]')) e.target.closest('[data-lbh-close]').style.color = '#e5e7eb';
+        const closeButton = closestFromEventTarget(e.target, '[data-lbh-close]');
+        if (closeButton) closeButton.style.color = '#e5e7eb';
     });
 
     // Restore saved position if available
@@ -676,6 +687,49 @@ function renderWidgetButton(label, action, isActive = false) {
     return `<button data-lbh-nodrag data-lbh-action="${action}" style="background:${background};color:#e5e7eb;border:1px solid ${border};border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer;">${label}</button>`;
 }
 
+let lastWidgetActionName = '';
+let lastWidgetActionAt = 0;
+
+function runWidgetAction(action) {
+    const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    if (action === lastWidgetActionName && now - lastWidgetActionAt < 250) return;
+    lastWidgetActionName = action;
+    lastWidgetActionAt = now;
+
+    if (action === 'toggle-transcript') {
+        transcriptPanelExpanded = !transcriptPanelExpanded;
+        if (settings.enabled) updateWordCount();
+    } else if (action === 'open-reference') {
+        openReferenceModal();
+    } else if (action === 'close-reference') {
+        closeReferenceModal();
+    }
+}
+
+function getWidgetActionElement(target) {
+    return closestFromEventTarget(target, '#lbh-word-count [data-lbh-action]');
+}
+
+function handleWidgetActionPress(e) {
+    if (typeof e.button === 'number' && e.button !== 0) return false;
+
+    const actionEl = getWidgetActionElement(e.target);
+    if (!actionEl) return false;
+
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    runWidgetAction(actionEl.getAttribute('data-lbh-action'));
+    return true;
+}
+
+function suppressWidgetActionClick(e) {
+    if (!getWidgetActionElement(e.target)) return false;
+
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    return true;
+}
+
 function getAccuracyColor(accuracyPct) {
     const pct = Math.max(0, Math.min(100, Number(accuracyPct) || 0));
     if (pct >= 95) return '#22c55e';
@@ -710,7 +764,7 @@ function ensureReferenceModal() {
         e.stopPropagation();
     });
     referenceModal.addEventListener('click', e => {
-        const actionEl = e.target.closest('[data-lbh-action="close-reference"]');
+        const actionEl = closestFromEventTarget(e.target, '[data-lbh-action="close-reference"]');
         if (actionEl) {
             e.preventDefault();
             e.stopPropagation();
@@ -1801,10 +1855,15 @@ startDomObserver();
 document.addEventListener('input', scheduleCheck);
 document.addEventListener('change', scheduleCheck);
 
+// Keep our widget controls responsive even when Labelbox registers broad click handlers.
+document.addEventListener('pointerdown', handleWidgetActionPress, true);
+document.addEventListener('mousedown', handleWidgetActionPress, true);
+document.addEventListener('click', suppressWidgetActionClick, true);
+
 // Capture-phase mousedown so the dismiss fires before any page handler can swallow the event
 document.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
-    const btn = e.target.closest('[data-lbh-close]');
+    const btn = closestFromEventTarget(e.target, '[data-lbh-close]');
     if (!btn || !btn.closest('#lbh-word-count')) return;
     e.stopPropagation();
     widgetDismissed = true;
@@ -1813,7 +1872,7 @@ document.addEventListener('mousedown', e => {
 }, true);
 
 document.addEventListener('click', e => {
-    const actionEl = e.target.closest('[data-lbh-action]');
+    const actionEl = closestFromEventTarget(e.target, '[data-lbh-action]');
     if (actionEl) {
         e.preventDefault();
         e.stopPropagation();
@@ -2036,7 +2095,7 @@ if (!isTopFrame()) {
     });
 
     document.addEventListener('click', e => {
-        if (e.target.closest && e.target.closest('#lbsg-toast')) return;
+        if (closestFromEventTarget(e.target, '#lbsg-toast')) return;
         const skipButton = findSkipButton();
         if (!skipButton) return;
         if (!skipButton.contains(e.target) && e.target !== skipButton) return;
