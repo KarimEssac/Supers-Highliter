@@ -1849,3 +1849,230 @@ if (!isTopFrame()) {
         }
     } catch (e) { /* cross-origin guard */ }
 }
+
+// Labelbox Skip Guard
+(function initSkipGuard() {
+    if (document.getElementById('lbsg-toast')) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+        #lbsg-toast {
+            position: fixed;
+            bottom: 32px;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            background: #1a1a2e;
+            color: #fff;
+            border: 1.5px solid #e63946;
+            border-radius: 10px;
+            padding: 14px 22px;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            z-index: 2147483647;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.18s ease, transform 0.18s ease;
+            white-space: nowrap;
+        }
+        #lbsg-toast.visible {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+            pointer-events: all;
+        }
+        #lbsg-toast .lbsg-icon {
+            align-items: center;
+            border: 1px solid #e63946;
+            border-radius: 999px;
+            color: #e63946;
+            display: inline-flex;
+            font-size: 14px;
+            font-weight: 700;
+            height: 22px;
+            justify-content: center;
+            line-height: 1;
+            width: 22px;
+        }
+        #lbsg-toast .lbsg-msg {
+            flex: 1;
+            line-height: 1.4;
+        }
+        #lbsg-toast .lbsg-msg strong {
+            display: block;
+            font-size: 13px;
+            color: #e63946;
+            margin-bottom: 2px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+        #lbsg-toast .lbsg-confirm {
+            background: #e63946;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 7px 16px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        #lbsg-toast .lbsg-confirm:hover {
+            background: #c1121f;
+        }
+        #lbsg-toast .lbsg-cancel {
+            background: transparent;
+            color: #aaa;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 7px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.15s, color 0.15s;
+        }
+        #lbsg-toast .lbsg-cancel:hover {
+            background: #333;
+            color: #fff;
+        }
+        #lbsg-timer-bar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            height: 3px;
+            background: #e63946;
+            border-radius: 0 0 10px 10px;
+            width: 100%;
+            transform-origin: left;
+            transform: scaleX(1);
+        }
+    `;
+    document.head.appendChild(style);
+
+    const toast = document.createElement('div');
+    toast.id = 'lbsg-toast';
+    toast.innerHTML = `
+        <span class="lbsg-icon">!</span>
+        <span class="lbsg-msg">
+            <strong>Skip Guard</strong>
+            Are you sure you want to skip?
+        </span>
+        <button class="lbsg-cancel" type="button">Cancel</button>
+        <button class="lbsg-confirm" type="button">Yes, Skip</button>
+        <div id="lbsg-timer-bar"></div>
+    `;
+    document.body.appendChild(toast);
+
+    const timerBar = toast.querySelector('#lbsg-timer-bar');
+    const confirmBtn = toast.querySelector('.lbsg-confirm');
+    const cancelBtn = toast.querySelector('.lbsg-cancel');
+    const DISMISS_MS = 4000;
+
+    let pendingSkipFn = null;
+    let dismissTimer = null;
+    let bypassNextSkipClick = false;
+
+    function findSkipButton() {
+        const ariaButton = document.querySelector('button[aria-label="or press s"]');
+        if (ariaButton) return ariaButton;
+
+        for (const button of document.querySelectorAll('button')) {
+            if (button.closest('#lbsg-toast')) continue;
+            if (button.textContent.trim().includes('Skip')) return button;
+        }
+        return null;
+    }
+
+    function dismiss() {
+        toast.classList.remove('visible');
+        clearTimeout(dismissTimer);
+        pendingSkipFn = null;
+    }
+
+    function showConfirm(doSkip) {
+        pendingSkipFn = doSkip;
+        clearTimeout(dismissTimer);
+
+        timerBar.style.transition = 'none';
+        timerBar.style.transform = 'scaleX(1)';
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                timerBar.style.transition = `transform ${DISMISS_MS}ms linear`;
+                timerBar.style.transform = 'scaleX(0)';
+            });
+        });
+
+        toast.classList.add('visible');
+        dismissTimer = setTimeout(dismiss, DISMISS_MS);
+    }
+
+    function confirmSkipByClick(skipButton) {
+        showConfirm(() => {
+            const button = document.body.contains(skipButton) ? skipButton : findSkipButton();
+            if (!button) return;
+            bypassNextSkipClick = true;
+            button.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                cancelable: true,
+                view: window
+            }));
+            bypassNextSkipClick = false;
+        });
+    }
+
+    confirmBtn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const doSkip = pendingSkipFn;
+        dismiss();
+        if (doSkip) doSkip();
+    });
+
+    cancelBtn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dismiss();
+    });
+
+    document.addEventListener('click', e => {
+        if (e.target.closest && e.target.closest('#lbsg-toast')) return;
+        const skipButton = findSkipButton();
+        if (!skipButton) return;
+        if (!skipButton.contains(e.target) && e.target !== skipButton) return;
+        if (bypassNextSkipClick) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        confirmSkipByClick(skipButton);
+    }, true);
+
+    function isSkipKey(e) {
+        const activeElement = document.activeElement;
+        const tag = activeElement?.tagName?.toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || activeElement?.isContentEditable) return false;
+        if (e.metaKey || e.ctrlKey || e.altKey) return false;
+        return e.key === 's' || e.key === 'S';
+    }
+
+    document.addEventListener('keydown', e => {
+        if (!isSkipKey(e)) return;
+        const skipButton = findSkipButton();
+        if (!skipButton) return;
+
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        confirmSkipByClick(skipButton);
+    }, true);
+
+    ['keypress', 'keyup'].forEach(eventType => {
+        document.addEventListener(eventType, e => {
+            if (!isSkipKey(e)) return;
+            const skipButton = findSkipButton();
+            if (!skipButton) return;
+
+            e.stopImmediatePropagation();
+            e.preventDefault();
+        }, true);
+    });
+})();

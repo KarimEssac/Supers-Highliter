@@ -39,6 +39,7 @@ const remoteEl = {
     srflagComment: document.getElementById('srflag-comment'),
     srflagAddBtn: document.getElementById('srflag-add-btn'),
     srflagPasteBtn: document.getElementById('srflag-paste-btn'),
+    srflagTranscriptBtn: document.getElementById('srflag-transcript-btn'),
     flagStatus: document.getElementById('flag-status'),
     tlPassword: document.getElementById('tl-password'),
     gistId: document.getElementById('gist-id'),
@@ -586,6 +587,28 @@ async function addItem(type, value, comment = '') {
     renderCommunityLists();
 }
 
+function formatTranscriptComment(capture) {
+    const beforeText = capture?.before?.text?.trim();
+    const afterText = capture?.after?.text?.trim();
+    if (!beforeText || !afterText) return '';
+
+    return `Before:\n${beforeText}\n\nAfter:\n${afterText}`;
+}
+
+async function pasteTranscriptComment() {
+    const { _lbhTranscriptionCapture } = await chrome.storage.local.get(['_lbhTranscriptionCapture']);
+    const comment = formatTranscriptComment(_lbhTranscriptionCapture);
+
+    if (!comment) {
+        setStatus(remoteEl.flagStatus, 'No transcript capture found', '#ef4444', 3000);
+        return;
+    }
+
+    remoteEl.srflagComment.value = comment;
+    remoteEl.srflagComment.focus();
+    setStatus(remoteEl.flagStatus, 'Transcript pasted', '#34d399', 2000);
+}
+
 // Load remote state on popup open
 chrome.storage.local.get({
     _lbhGistId: '5c272fb9bcef9a069bed8e976b47b150',
@@ -660,6 +683,7 @@ remoteEl.auditAddBtn.addEventListener('click', () => addItem('audit', remoteEl.a
 remoteEl.auditInput.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('audit', remoteEl.auditInput.value); });
 
 remoteEl.srflagAddBtn.addEventListener('click', () => addItem('srflag', remoteEl.srflagInput.value, remoteEl.srflagComment.value));
+remoteEl.srflagTranscriptBtn.addEventListener('click', pasteTranscriptComment);
 remoteEl.srflagInput.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('srflag', remoteEl.srflagInput.value, remoteEl.srflagComment.value); });
 remoteEl.srflagComment.addEventListener('keydown', e => { if (e.key === 'Enter') addItem('srflag', remoteEl.srflagInput.value, remoteEl.srflagComment.value); });
 

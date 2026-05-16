@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Super Highlighter",
-  "version": "1.1",
+  "version": "2.0",
   "description": "Highlights configured words/symbols with community-managed lists and Labelbox tab utilities",
   "icons": {
     "48": "highlighter.png",
