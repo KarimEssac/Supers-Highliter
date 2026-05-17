@@ -588,8 +588,8 @@ async function addItem(type, value, comment = '') {
 }
 
 function formatTranscriptComment(capture) {
-    const beforeText = capture?.before?.text?.trim();
-    const afterText = capture?.after?.text?.trim();
+    const beforeText = (capture?.before?.displayText || capture?.before?.text || '').trim();
+    const afterText = (capture?.after?.displayText || capture?.after?.text || '').trim();
     if (!beforeText || !afterText) return '';
 
     return `Before:\n${beforeText}\n\nAfter:\n${afterText}`;

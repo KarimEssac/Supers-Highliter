@@ -25,6 +25,11 @@ const pinkTextHighlightColor = "rgba(244, 114, 182, 0.35)";
 const purpleTextHighlightColor = "rgba(168, 85, 247, 0.35)";
 const blueTextHighlightColor = "rgba(59, 130, 246, 0.35)";
 const TARGET_SELECTOR = 'textarea, div.vis-item-content';
+const DEBUG_LOGS = false;
+const ROLE_ASSIGNMENTS_CACHE_MS = 350;
+const WIDGET_COLLAPSED_WIDTH_PX = 320;
+const WIDGET_EXPANDED_DEFAULT_WIDTH_PX = 520;
+const WIDGET_EXPANDED_DEFAULT_HEIGHT_PX = 430;
 
 let settings = { ...DEFAULT_SETTINGS, remoteRemoved: [], remoteCommunityAudit: [], remoteSrFlag: [] };
 let isCheckScheduled = false;
@@ -32,6 +37,7 @@ let isCheckRunning = false;
 let shouldRunAgain = false;
 let needsFullReset = false;
 let domObserver = null;
+let highlightWatchdog = null;
 let widgetDismissed = false;
 // TT sourced from network interception (-1 = not yet received)
 let networkTtMs = -1;
@@ -42,10 +48,41 @@ let referenceModal = null;
 let transcriptionCapture = { rowKey: '', before: null, after: null, metrics: null };
 let childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
 let lastSavedTranscriptionSignature = '';
+let speakerRoleAssignmentsCache = { rowKey: '', at: 0, map: new Map() };
+let transcriptCopyStatus = { side: '', at: 0, timer: null };
+let lastRenderedWidgetHtml = '';
+let widgetExpandedSize = {
+    width: WIDGET_EXPANDED_DEFAULT_WIDTH_PX,
+    height: WIDGET_EXPANDED_DEFAULT_HEIGHT_PX
+};
 
 // ── Word Count Widget ─────────────────────────────────────────────────────────
 
 let wordCountWidget = null;
+
+function isWidgetResizeHandlePress(widget, e) {
+    if (!transcriptPanelExpanded) return false;
+    const rect = widget.getBoundingClientRect();
+    const handleSize = 20;
+    return e.clientX >= rect.right - handleSize && e.clientY >= rect.bottom - handleSize;
+}
+
+function suppressNextWidgetToggle(widget, delayMs = 450) {
+    widget.dataset.lbhSkipToggleClick = 'true';
+    window.setTimeout(() => {
+        if (widget.dataset.lbhSkipToggleClick === 'true') {
+            delete widget.dataset.lbhSkipToggleClick;
+        }
+    }, delayMs);
+}
+
+function toggleTranscriptPanel() {
+    if (transcriptPanelExpanded && wordCountWidget) {
+        persistWidgetExpandedSize(wordCountWidget);
+    }
+    transcriptPanelExpanded = !transcriptPanelExpanded;
+    if (settings.enabled) updateWordCount();
+}
 
 function countWordsInText(text) {
     if (!text) return 0;
@@ -81,53 +118,546 @@ function getCurrentDataRowKey() {
     return `${match[1]}/${match[2]}`;
 }
 
+function getTimelineItemForElement(el) {
+    return el && el.closest ? el.closest('.vis-item') : null;
+}
+
+function getTimelineItemSortKey(item) {
+    if (!item) return { x: Number.MAX_SAFE_INTEGER, y: Number.MAX_SAFE_INTEGER };
+
+    const rect = item.getBoundingClientRect();
+    const transform = item.style && item.style.transform;
+    const translateMatch = transform && (
+        transform.match(/translateX\(([-\d.]+)px\)/)
+        || transform.match(/translate3d\(([-\d.]+)px/i)
+        || transform.match(/translate\(([-\d.]+)px/i)
+    );
+    const x = translateMatch ? parseFloat(translateMatch[1]) : rect.left;
+
+    return {
+        x: Number.isFinite(x) ? x : rect.left,
+        y: rect.top
+    };
+}
+
+function compareTranscriptElementsByTimeline(a, b) {
+    const aKey = getTimelineItemSortKey(getTimelineItemForElement(a));
+    const bKey = getTimelineItemSortKey(getTimelineItemForElement(b));
+    return (aKey.x - bKey.x) || (aKey.y - bKey.y);
+}
+
 function getSavedTranscriptElements() {
     return [...document.querySelectorAll('div.vis-item-content')]
-        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el));
+        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el))
+        .sort(compareTranscriptElementsByTimeline);
+}
+
+function isRoleComboboxTextarea(el) {
+    if (!el || !el.matches || !el.matches('textarea')) return false;
+    const role = el.getAttribute('role') || '';
+    const placeholder = el.getAttribute('placeholder') || '';
+    const ariaAutocomplete = el.getAttribute('aria-autocomplete') || '';
+    const className = String(el.className || '');
+
+    return role === 'combobox'
+        || /select one/i.test(placeholder)
+        || ariaAutocomplete === 'list'
+        || /MuiAutocomplete-input/i.test(className);
+}
+
+function isTranscriptTextarea(el) {
+    if (!el || !el.matches || !el.matches('textarea')) return false;
+    if (el.closest('#lbh-word-count') || el.closest('#lbsg-toast')) return false;
+    if (isRoleComboboxTextarea(el)) return false;
+    return true;
+}
+
+function isExtensionUiElement(el) {
+    return !!(el && el.closest && (el.closest('#lbh-word-count') || el.closest('#lbsg-toast') || el.closest('#lbh-reference-modal')));
+}
+
+function isTranscriptDisplayTextarea(el) {
+    return !!(el && el.matches && el.matches('[data-lbh-selectable]'));
+}
+
+function isWidgetNode(node) {
+    const el = node && node.nodeType === Node.ELEMENT_NODE ? node : node && node.parentElement;
+    return !!(el && el.closest && el.closest('#lbh-word-count'));
 }
 
 function getLiveTranscriptTextareas() {
     return [...document.querySelectorAll('textarea')]
-        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el));
+        .filter(el => el.getAttribute('aria-hidden') !== 'true' && isElementVisible(el) && isTranscriptTextarea(el));
 }
 
 function getActiveTranscriptTextarea() {
     const active = document.activeElement;
-    if (!active || !active.matches || !active.matches('textarea')) return null;
+    if (!isTranscriptTextarea(active)) return null;
     if (active.getAttribute('aria-hidden') === 'true' || !isElementVisible(active)) return null;
     return active;
 }
 
+function normalizeSpeakerRole(role) {
+    const value = String(role || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/[\u200b-\u200f\uFEFF]/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/\*+$/, '')
+        .trim();
+
+    if (!value) return '';
+    if (!/[A-Za-z0-9]/.test(value)) return '';
+    if (value.length > 50 || value.split(/\s+/).length > 5) return '';
+    if (/[?]/.test(value)) return '';
+    if (/^\d+$/.test(value)) return '';
+    if (/^(select|choose|none|n\/a|global classifications|sub-class|what is|how many speakers|data|data rows|overview|evaluation|performance|issues|notifications|settings|start)$/i.test(value)) return '';
+    return value;
+}
+
+function getElementReadableText(el) {
+    if (!el) return '';
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+
+    if (tag === 'select') {
+        const selected = el.selectedOptions && el.selectedOptions[0];
+        return selected ? (selected.textContent || selected.value || '') : (el.value || '');
+    }
+
+    if (tag === 'input' || tag === 'textarea') {
+        return el.value || el.textContent || el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+    }
+
+    return el.innerText || el.textContent || el.getAttribute('aria-label') || '';
+}
+
+function getRoleQuestionSpeakerNumbers() {
+    const seen = new Set();
+    const speakers = [];
+    const lines = String(document.body?.innerText || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    lines.forEach(line => {
+        const match = line.match(/what\s+is\s+the\s+role\s+for\s+speaker\s*(\d+)/i);
+        if (!match) return;
+
+        const speakerNumber = parseInt(match[1], 10);
+        if (!Number.isFinite(speakerNumber) || seen.has(speakerNumber)) return;
+
+        seen.add(speakerNumber);
+        speakers.push(speakerNumber);
+    });
+
+    return speakers;
+}
+
+function getRoleQuestionAnchors() {
+    const anchors = [];
+    const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+        {
+            acceptNode(node) {
+                return /what\s+is\s+the\s+role\s+for\s+speaker\s*\d+/i.test(node.nodeValue || '')
+                    ? NodeFilter.FILTER_ACCEPT
+                    : NodeFilter.FILTER_REJECT;
+            }
+        }
+    );
+
+    let node;
+    while ((node = walker.nextNode())) {
+        const match = String(node.nodeValue || '').match(/what\s+is\s+the\s+role\s+for\s+speaker\s*(\d+)/i);
+        if (!match) continue;
+
+        let el = node.parentElement;
+        while (el && el !== document.body) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                anchors.push({
+                    speakerNumber: parseInt(match[1], 10),
+                    rect,
+                    text: String(node.nodeValue || '').trim()
+                });
+                break;
+            }
+            el = el.parentElement;
+        }
+    }
+
+    return anchors
+        .filter(anchor => Number.isFinite(anchor.speakerNumber))
+        .sort((a, b) => (a.rect.top - b.rect.top) || (a.rect.left - b.rect.left));
+}
+
+function isRoleValueControl(el) {
+    if (!el || !el.matches) return false;
+    if (el.closest('#lbh-word-count') || el.closest('#lbsg-toast')) return false;
+
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const placeholder = el.getAttribute('placeholder') || '';
+    const ariaAutocomplete = el.getAttribute('aria-autocomplete') || '';
+    const className = String(el.className || '');
+    const role = el.getAttribute('role') || '';
+
+    if (tag === 'select') return true;
+    return role === 'combobox'
+        || /select one/i.test(placeholder)
+        || ariaAutocomplete === 'list'
+        || /MuiAutocomplete-input/i.test(className);
+}
+
+function getRoleValueControlFromNode(node) {
+    const el = node && node.nodeType === Node.ELEMENT_NODE ? node : node && node.parentElement;
+    if (!el || !el.closest) return null;
+
+    if (isRoleValueControl(el)) return el;
+    const control = el.closest('textarea[role="combobox"],input[role="combobox"],textarea.MuiAutocomplete-input,input.MuiAutocomplete-input,select');
+    return isRoleValueControl(control) ? control : null;
+}
+
+function getRoleValueControls() {
+    return [...new Set([
+        ...document.querySelectorAll('textarea[role="combobox"]'),
+        ...document.querySelectorAll('input[role="combobox"]'),
+        ...document.querySelectorAll('textarea.MuiAutocomplete-input'),
+        ...document.querySelectorAll('input.MuiAutocomplete-input'),
+        ...document.querySelectorAll('select')
+    ])]
+        .filter(el => isElementVisible(el) && isRoleValueControl(el))
+        .map(el => {
+            const role = normalizeSpeakerRole(getElementReadableText(el));
+            const rect = el.getBoundingClientRect();
+            return { el, role, rect };
+        })
+        .filter(item => item.role);
+}
+
+function getVisibleRoleScanElements() {
+    const selectors = [
+        'select',
+        'input',
+        'textarea',
+        '[role="combobox"]',
+        '[aria-haspopup="listbox"]',
+        '[aria-label*="speaker" i]',
+        '[aria-label*="role" i]'
+    ];
+    return [...new Set(selectors.flatMap(selector => [...document.querySelectorAll(selector)]))]
+        .filter(el => isElementVisible(el))
+        .slice(0, 200);
+}
+
+function addRoleAssignmentsFromControls(roleMap) {
+    const elements = getVisibleRoleScanElements();
+
+    elements.forEach((el, index) => {
+        const questionText = getElementReadableText(el)
+            .replace(/\u00a0/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!questionText || questionText.length > 180) return;
+
+        const match = questionText.match(/what\s+is\s+the\s+role\s+for\s+speaker\s*(\d+)/i);
+        if (!match) return;
+
+        const speakerNumber = parseInt(match[1], 10);
+        const inlineRole = getInlineRoleFromRoleQuestion(questionText);
+        if (inlineRole) {
+            roleMap.set(speakerNumber, inlineRole);
+            return;
+        }
+
+        for (let j = index + 1; j < Math.min(elements.length, index + 80); j += 1) {
+            const candidateText = getElementReadableText(elements[j])
+                .replace(/\u00a0/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!candidateText) continue;
+
+            const nextQuestion = candidateText.match(/what\s+is\s+the\s+role\s+for\s+speaker\s*(\d+)/i);
+            if (nextQuestion && parseInt(nextQuestion[1], 10) !== speakerNumber) break;
+            if (nextQuestion) continue;
+            if (/how\s+many\s+speakers\s+are\s+there/i.test(candidateText)) break;
+            if (/^(global classifications|sub-class|speaker\s+\d+)$/i.test(candidateText)) continue;
+
+            const role = normalizeSpeakerRole(candidateText);
+            if (role) {
+                roleMap.set(speakerNumber, role);
+                break;
+            }
+        }
+    });
+}
+
+function addRoleAssignmentsFromRoleValueControls(roleMap) {
+    const speakerNumbers = getRoleQuestionSpeakerNumbers();
+    if (speakerNumbers.length === 0) return;
+
+    const roleControls = getRoleValueControls();
+    const anchors = getRoleQuestionAnchors();
+
+    if (anchors.length > 0) {
+        anchors.forEach((anchor, index) => {
+            const nextAnchorTop = anchors[index + 1] ? anchors[index + 1].rect.top : Number.POSITIVE_INFINITY;
+            const match = roleControls
+                .filter(item => item.rect.top >= anchor.rect.top - 4)
+                .filter(item => item.rect.top < Math.min(nextAnchorTop, anchor.rect.top + 180))
+                .sort((a, b) => {
+                    const aDistance = Math.abs(a.rect.top - anchor.rect.bottom) + Math.abs(a.rect.left - anchor.rect.left) * 0.1;
+                    const bDistance = Math.abs(b.rect.top - anchor.rect.bottom) + Math.abs(b.rect.left - anchor.rect.left) * 0.1;
+                    return aDistance - bDistance;
+                })[0];
+
+            if (match) roleMap.set(anchor.speakerNumber, match.role);
+        });
+
+        return;
+    }
+
+    speakerNumbers.forEach((speakerNumber, index) => {
+        if (roleMap.has(speakerNumber)) return;
+        const match = roleControls[index];
+        if (match) roleMap.set(speakerNumber, match.role);
+    });
+}
+
+function getInlineRoleFromRoleQuestion(line) {
+    const tail = String(line || '')
+        .replace(/^.*?what\s+is\s+the\s+role\s+for\s+speaker\s*\d+\s*\??\s*\*?/i, '')
+        .replace(/^\s*\d+\s*/, '')
+        .trim();
+
+    if (!tail || /what\s+is\s+the\s+role\s+for\s+speaker/i.test(tail)) return '';
+    return normalizeSpeakerRole(tail);
+}
+
+function addRoleAssignmentsFromPageText(roleMap) {
+    const lines = String(document.body?.innerText || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    for (let i = 0; i < lines.length; i += 1) {
+        const match = lines[i].match(/what\s+is\s+the\s+role\s+for\s+speaker\s*(\d+)/i);
+        if (!match) continue;
+
+        const speakerNumber = parseInt(match[1], 10);
+        if (roleMap.has(speakerNumber)) continue;
+
+        const inlineRole = getInlineRoleFromRoleQuestion(lines[i]);
+        if (inlineRole) {
+            roleMap.set(speakerNumber, inlineRole);
+            continue;
+        }
+
+        for (let j = i + 1; j < Math.min(lines.length, i + 8); j += 1) {
+            if (/what\s+is\s+the\s+role\s+for\s+speaker/i.test(lines[j])) break;
+            if (/how\s+many\s+speakers\s+are\s+there/i.test(lines[j])) break;
+
+            const role = normalizeSpeakerRole(lines[j]);
+            if (role) {
+                roleMap.set(speakerNumber, role);
+                break;
+            }
+        }
+    }
+}
+
+function getSpeakerRoleAssignments(force = false) {
+    const now = Date.now();
+    const rowKey = getCurrentDataRowKey();
+    if (
+        !force
+        && speakerRoleAssignmentsCache.rowKey === rowKey
+        && now - speakerRoleAssignmentsCache.at < ROLE_ASSIGNMENTS_CACHE_MS
+    ) {
+        return new Map(speakerRoleAssignmentsCache.map);
+    }
+
+    const roleMap = new Map();
+    addRoleAssignmentsFromPageText(roleMap);
+    addRoleAssignmentsFromControls(roleMap);
+    addRoleAssignmentsFromRoleValueControls(roleMap);
+
+    speakerRoleAssignmentsCache = { rowKey, at: now, map: new Map(roleMap) };
+
+    return new Map(roleMap);
+}
+
+function getVisibleTranscriptTimelineItems(extraItems = [], savedElements = null) {
+    const items = new Set(extraItems.filter(Boolean));
+    (savedElements || getSavedTranscriptElements()).forEach(el => items.add(getTimelineItemForElement(el)));
+    getLiveTranscriptTextareas().forEach(el => items.add(getTimelineItemForElement(el)));
+    return [...items].filter(item => item && isElementVisible(item));
+}
+
+function getSpeakerNumbersForTimelineItems(items) {
+    const itemToRow = new Map();
+
+    // Build a map from each .vis-group element to its ACTUAL speaker number by
+    // reading the sidebar labels (.vis-label elements in .vis-labelset).
+    // The labels and groups are rendered in the same top-to-bottom DOM order,
+    // so label[i] corresponds to group[i]. The label text is e.g. "Speaker 2"
+    // or just "2" — we parse the number from it directly instead of assuming
+    // visual row order equals speaker number order.
+    const groupToSpeakerNumber = new Map();
+
+    const groups = [...document.querySelectorAll('.vis-foreground .vis-group')];
+    const labels = [...document.querySelectorAll('.vis-labelset .vis-label')];
+
+    if (groups.length > 0) {
+        groups.forEach((group, index) => {
+            const label = labels[index];
+            const labelText = label ? (label.innerText || label.textContent || '').trim() : '';
+            // Try to parse a speaker number from the label, e.g. "Speaker 2" → 2
+            const match = labelText.match(/(\d+)/);
+            if (match) {
+                groupToSpeakerNumber.set(group, parseInt(match[1], 10));
+            } else {
+                // Label has no number (e.g. a named speaker) — fall back to 1-based index
+                groupToSpeakerNumber.set(group, index + 1);
+            }
+        });
+    }
+
+    const hasGroups = groupToSpeakerNumber.size > 0;
+    const unmapped = [];
+
+    items.forEach(item => {
+        if (!item) return;
+        const group = item.closest('.vis-group');
+        if (hasGroups && group && groupToSpeakerNumber.has(group)) {
+            itemToRow.set(item, groupToSpeakerNumber.get(group));
+        } else {
+            unmapped.push(item);
+        }
+    });
+
+    // Fallback for flat/single-row layouts where .vis-group elements don't exist.
+    if (unmapped.length > 0) {
+        const rows = [];
+        const tolerancePx = 8;
+
+        unmapped.forEach(item => {
+            const rect = item.getBoundingClientRect();
+            const topCandidate = (rect.height > 0) ? (rect.top + rect.height / 2) : item.offsetTop;
+            const centerY = Number.isFinite(topCandidate) ? topCandidate : 0;
+
+            let row = rows.find(candidate => Math.abs(candidate.centerY - centerY) <= tolerancePx);
+            if (!row) {
+                row = { centerY, items: [] };
+                rows.push(row);
+            } else {
+                row.centerY = (row.centerY * row.items.length + centerY) / (row.items.length + 1);
+            }
+            row.items.push(item);
+        });
+
+        rows.sort((a, b) => a.centerY - b.centerY);
+        rows.forEach((row, index) => {
+            row.items.forEach(item => itemToRow.set(item, index + 1));
+        });
+    }
+
+    return itemToRow;
+}
+
+function getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers) {
+    const speakerNumber = itemSpeakerNumbers.get(item);
+    return roleMap.get(speakerNumber) || '';
+}
+
+function getSavedTranscriptSegments(savedElements = getSavedTranscriptElements()) {
+    const roleMap = getSpeakerRoleAssignments();
+    const timelineItems = getVisibleTranscriptTimelineItems(savedElements.map(getTimelineItemForElement), savedElements);
+    const itemSpeakerNumbers = getSpeakerNumbersForTimelineItems(timelineItems);
+
+    return savedElements.map(el => {
+        const item = getTimelineItemForElement(el);
+        const speakerNumber = itemSpeakerNumbers.get(item) || null;
+        return {
+            text: el.textContent || '',
+            role: getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers),
+            speakerNumber
+        };
+    });
+}
+
+function getTranscriptSpeakerInfoForTextarea(textarea) {
+    const roleMap = getSpeakerRoleAssignments();
+    const item = getTimelineItemForElement(textarea) || document.querySelector('.vis-item.vis-selected');
+    // Use ALL visible timeline items so speaker rank is computed relative to
+    // every row — not just the one item being edited (which would always get rank 1).
+    const allItems = getVisibleTranscriptTimelineItems([item]);
+    const itemSpeakerNumbers = getSpeakerNumbersForTimelineItems(allItems);
+    const speakerNumber = itemSpeakerNumbers.get(item) || null;
+    return {
+        role: getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers),
+        speakerNumber
+    };
+}
+
+function formatTranscriptSegmentForDisplay(segment) {
+    return segment.role ? `${segment.role}: ${segment.text}` : segment.text;
+}
+
 function buildSnapshotFromSegments(segments) {
     const cleanSegments = segments
-        .map(segment => normalizeSegmentText(segment))
-        .filter(segment => segment.length > 0);
+        .map(segment => {
+            if (segment && typeof segment === 'object') {
+                return {
+                    text: normalizeSegmentText(segment.text),
+                    role: normalizeSpeakerRole(segment.role),
+                    speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null
+                };
+            }
+
+            return {
+                text: normalizeSegmentText(segment),
+                role: '',
+                speakerNumber: null
+            };
+        })
+        .filter(segment => segment.text.length > 0);
 
     if (cleanSegments.length === 0) return null;
 
-    const text = cleanSegments.join('\n');
+    const textSegments = cleanSegments.map(segment => segment.text);
+    const displaySegments = cleanSegments.map(formatTranscriptSegmentForDisplay);
+    const text = textSegments.join('\n');
+    const displayText = displaySegments.join('\n');
+
     return {
-        segments: cleanSegments,
+        segments: textSegments,
+        roles: cleanSegments.map(segment => segment.role),
+        speakerNumbers: cleanSegments.map(segment => segment.speakerNumber),
+        displaySegments,
         text,
+        displayText,
         segmentCount: cleanSegments.length,
         wordCount: countWordsInText(text),
         charCount: text.length,
-        signature: cleanSegments.join('\n\u241e')
+        signature: displaySegments.join('\n\u241e')
     };
 }
 
 function buildSavedTranscriptSnapshot() {
-    const savedElements = getSavedTranscriptElements();
-    return buildSnapshotFromSegments(savedElements.map(el => el.textContent || ''));
+    return buildSnapshotFromSegments(getSavedTranscriptSegments());
 }
 
 function buildLiveTranscriptSnapshot() {
     const savedElements = getSavedTranscriptElements();
-    const savedSegments = savedElements.map(el => el.textContent || '');
+    const savedSegments = getSavedTranscriptSegments(savedElements);
     const activeTextarea = getActiveTranscriptTextarea();
 
     if (savedSegments.length > 0) {
-        const mergedSegments = savedSegments.map(segment => normalizeSegmentText(segment));
+        const mergedSegments = savedSegments.map(segment => ({
+            text: normalizeSegmentText(segment.text),
+            role: normalizeSpeakerRole(segment.role),
+            speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null
+        }));
         if (activeTextarea) {
             const liveText = normalizeSegmentText(activeTextarea.value || '');
             const selectedContent = document.querySelector('.vis-item.vis-selected div.vis-item-content')
@@ -136,15 +666,21 @@ function buildLiveTranscriptSnapshot() {
             const selectedIndex = selectedContent ? savedElements.indexOf(selectedContent) : -1;
 
             if (liveText) {
-                const savedText = selectedIndex >= 0 ? normalizeSegmentText(mergedSegments[selectedIndex]) : '';
+                const savedText = selectedIndex >= 0 ? normalizeSegmentText(mergedSegments[selectedIndex].text) : '';
                 const looksLikeEditorPlaceholder = /^\d{1,2}$/.test(liveText) && savedText && savedText !== liveText;
                 if (looksLikeEditorPlaceholder) {
                     return buildSnapshotFromSegments(mergedSegments);
                 }
                 if (selectedIndex >= 0) {
-                    mergedSegments[selectedIndex] = liveText;
+                    mergedSegments[selectedIndex] = {
+                        ...mergedSegments[selectedIndex],
+                        text: liveText
+                    };
                 } else if (mergedSegments.length === 1) {
-                    mergedSegments[0] = liveText;
+                    mergedSegments[0] = {
+                        ...mergedSegments[0],
+                        text: liveText
+                    };
                 }
             }
         }
@@ -154,7 +690,12 @@ function buildLiveTranscriptSnapshot() {
     if (!activeTextarea) return null;
     const activeText = normalizeSegmentText(activeTextarea.value || '');
     if (/^\d{1,2}$/.test(activeText)) return null;
-    return buildSnapshotFromSegments([activeText]);
+    const speakerInfo = getTranscriptSpeakerInfoForTextarea(activeTextarea);
+    return buildSnapshotFromSegments([{
+        text: activeText,
+        role: speakerInfo.role,
+        speakerNumber: speakerInfo.speakerNumber
+    }]);
 }
 
 function getTranscriptTokens(text, preserveCase = false) {
@@ -194,10 +735,13 @@ function toAccuracyPct(total, errors) {
 function computeTranscriptionMetrics(beforeSnapshot, afterSnapshot) {
     if (!beforeSnapshot || !afterSnapshot) return null;
 
-    const beforeWordTokens = getTranscriptTokens(beforeSnapshot.text);
-    const afterWordTokens = getTranscriptTokens(afterSnapshot.text);
-    const beforeExactTokens = getTranscriptTokens(beforeSnapshot.text, true);
-    const afterExactTokens = getTranscriptTokens(afterSnapshot.text, true);
+    // Accuracy is calculated from raw segment text only; role labels are display-only.
+    const beforeAccuracyText = (beforeSnapshot.segments || []).join('\n') || beforeSnapshot.text || '';
+    const afterAccuracyText = (afterSnapshot.segments || []).join('\n') || afterSnapshot.text || '';
+    const beforeWordTokens = getTranscriptTokens(beforeAccuracyText);
+    const afterWordTokens = getTranscriptTokens(afterAccuracyText);
+    const beforeExactTokens = getTranscriptTokens(beforeAccuracyText, true);
+    const afterExactTokens = getTranscriptTokens(afterAccuracyText, true);
 
     const wordChanges = levenshteinDistance(beforeWordTokens, afterWordTokens);
     const exactChanges = levenshteinDistance(beforeExactTokens, afterExactTokens);
@@ -217,13 +761,62 @@ function computeTranscriptionMetrics(beforeSnapshot, afterSnapshot) {
 function cloneTranscriptSnapshot(snapshot) {
     if (!snapshot) return null;
     return {
-        segments: [...snapshot.segments],
+        segments: [...(snapshot.segments || [])],
+        roles: [...(snapshot.roles || [])],
+        speakerNumbers: [...(snapshot.speakerNumbers || [])],
+        displaySegments: [...(snapshot.displaySegments || snapshot.segments || [])],
         text: snapshot.text,
+        displayText: snapshot.displayText || snapshot.text,
         segmentCount: snapshot.segmentCount,
         wordCount: snapshot.wordCount,
         charCount: snapshot.charCount,
         signature: snapshot.signature
     };
+}
+
+function applyCurrentRoleAssignmentsToSnapshot(snapshot) {
+    if (!snapshot || !snapshot.speakerNumbers || !snapshot.speakerNumbers.some(Number.isFinite)) return snapshot;
+
+    const roleMap = getSpeakerRoleAssignments();
+    if (roleMap.size === 0) return snapshot;
+
+    const segments = snapshot.segments.map((text, index) => {
+        const speakerNumber = snapshot.speakerNumbers[index];
+        return {
+            text,
+            role: roleMap.get(speakerNumber) || (snapshot.roles ? snapshot.roles[index] : ''),
+            speakerNumber
+        };
+    });
+
+    return buildSnapshotFromSegments(segments) || snapshot;
+}
+
+function snapshotNeedsMissingRoleBackfill(snapshot) {
+    if (!snapshot || !snapshot.speakerNumbers || !snapshot.segments) return false;
+    return snapshot.speakerNumbers.some((speakerNumber, index) => (
+        Number.isFinite(speakerNumber)
+        && !normalizeSpeakerRole(snapshot.roles ? snapshot.roles[index] : '')
+    ));
+}
+
+function fillMissingRoleAssignmentsInSnapshot(snapshot) {
+    if (!snapshotNeedsMissingRoleBackfill(snapshot)) return snapshot;
+
+    const roleMap = getSpeakerRoleAssignments();
+    if (roleMap.size === 0) return snapshot;
+
+    const segments = snapshot.segments.map((text, index) => {
+        const speakerNumber = snapshot.speakerNumbers[index];
+        const existingRole = normalizeSpeakerRole(snapshot.roles ? snapshot.roles[index] : '');
+        return {
+            text,
+            role: existingRole || roleMap.get(speakerNumber) || '',
+            speakerNumber
+        };
+    });
+
+    return buildSnapshotFromSegments(segments) || snapshot;
 }
 
 function choosePreferredSnapshot(localSnapshot, childSnapshot) {
@@ -240,11 +833,30 @@ function choosePreferredSnapshot(localSnapshot, childSnapshot) {
 }
 
 function getPreferredSavedTranscriptSnapshot() {
-    return choosePreferredSnapshot(buildSavedTranscriptSnapshot(), childFrameTranscript.savedSnapshot);
+    const local = buildSavedTranscriptSnapshot();
+    const child = childFrameTranscript.savedSnapshot;
+    // Only apply local role assignments to a locally-built snapshot.
+    // If we pick the child snapshot, its speakerNumbers are row indices
+    // from the child frame's timeline — applying the parent's roleMap would
+    // assign the wrong speaker roles.
+    if (!local) return child ? cloneTranscriptSnapshot(child) : null;
+    const localWithRoles = applyCurrentRoleAssignmentsToSnapshot(local);
+    if (!child) return localWithRoles;
+    if (child.segmentCount > local.segmentCount) return cloneTranscriptSnapshot(child);
+    if (child.segmentCount === local.segmentCount && child.charCount > local.charCount) return cloneTranscriptSnapshot(child);
+    return localWithRoles;
 }
 
 function getPreferredLiveTranscriptSnapshot() {
-    return choosePreferredSnapshot(buildLiveTranscriptSnapshot(), childFrameTranscript.liveSnapshot);
+    const local = buildLiveTranscriptSnapshot();
+    const child = childFrameTranscript.liveSnapshot;
+    // Same reasoning as getPreferredSavedTranscriptSnapshot above.
+    if (!local) return child ? cloneTranscriptSnapshot(child) : null;
+    const localWithRoles = applyCurrentRoleAssignmentsToSnapshot(local);
+    if (!child) return localWithRoles;
+    if (child.segmentCount > local.segmentCount) return cloneTranscriptSnapshot(child);
+    if (child.segmentCount === local.segmentCount && child.charCount > local.charCount) return cloneTranscriptSnapshot(child);
+    return localWithRoles;
 }
 
 function persistTranscriptionCapture() {
@@ -255,13 +867,21 @@ function persistTranscriptionCapture() {
             rowKey: transcriptionCapture.rowKey,
             before: transcriptionCapture.before ? {
                 segments: [...transcriptionCapture.before.segments],
+                roles: [...(transcriptionCapture.before.roles || [])],
+                speakerNumbers: [...(transcriptionCapture.before.speakerNumbers || [])],
+                displaySegments: [...(transcriptionCapture.before.displaySegments || transcriptionCapture.before.segments)],
                 text: transcriptionCapture.before.text,
+                displayText: transcriptionCapture.before.displayText || transcriptionCapture.before.text,
                 segmentCount: transcriptionCapture.before.segmentCount,
                 wordCount: transcriptionCapture.before.wordCount
             } : null,
             after: transcriptionCapture.after ? {
                 segments: [...transcriptionCapture.after.segments],
+                roles: [...(transcriptionCapture.after.roles || [])],
+                speakerNumbers: [...(transcriptionCapture.after.speakerNumbers || [])],
+                displaySegments: [...(transcriptionCapture.after.displaySegments || transcriptionCapture.after.segments)],
                 text: transcriptionCapture.after.text,
+                displayText: transcriptionCapture.after.displayText || transcriptionCapture.after.text,
                 segmentCount: transcriptionCapture.after.segmentCount,
                 wordCount: transcriptionCapture.after.wordCount
             } : null,
@@ -294,6 +914,10 @@ function updateTranscriptionCapture() {
 
     if (!transcriptionCapture.before && beforeSnapshot) {
         transcriptionCapture.before = cloneTranscriptSnapshot(beforeSnapshot);
+    } else if (snapshotNeedsMissingRoleBackfill(transcriptionCapture.before)) {
+        transcriptionCapture.before = cloneTranscriptSnapshot(
+            fillMissingRoleAssignmentsInSnapshot(transcriptionCapture.before)
+        );
     }
 
     transcriptionCapture.after = afterSnapshot ? cloneTranscriptSnapshot(afterSnapshot) : null;
@@ -417,8 +1041,57 @@ function applyWidgetPosition(widget, x, y) {
     widget.style.bottom = 'auto';
 }
 
+function clampWidgetExpandedSize(width, height) {
+    const maxWidth = Math.max(WIDGET_COLLAPSED_WIDTH_PX, window.innerWidth - 24);
+    const maxHeight = Math.max(220, window.innerHeight - 24);
+
+    return {
+        width: Math.max(WIDGET_COLLAPSED_WIDTH_PX, Math.min(Number(width) || WIDGET_EXPANDED_DEFAULT_WIDTH_PX, maxWidth)),
+        height: Math.max(260, Math.min(Number(height) || WIDGET_EXPANDED_DEFAULT_HEIGHT_PX, maxHeight))
+    };
+}
+
+function persistWidgetExpandedSize(widget) {
+    if (!widget || !transcriptPanelExpanded) return;
+    const rect = widget.getBoundingClientRect();
+    const size = clampWidgetExpandedSize(rect.width, rect.height);
+    widgetExpandedSize = size;
+    chrome.storage.local.set({
+        _lbhWidgetExpandedWidth: size.width,
+        _lbhWidgetExpandedHeight: size.height
+    });
+}
+
+function applyWidgetSizeMode(widget) {
+    if (!widget || widget.dataset.lbhResizing === 'true') return;
+
+    if (!transcriptPanelExpanded) {
+        widget.style.resize = 'none';
+        widget.style.width = `${WIDGET_COLLAPSED_WIDTH_PX}px`;
+        widget.style.height = 'auto';
+        widget.style.minHeight = '0';
+        widget.style.maxHeight = 'min(80vh, calc(100vh - 24px))';
+        return;
+    }
+
+    const size = clampWidgetExpandedSize(widgetExpandedSize.width, widgetExpandedSize.height);
+    widget.style.resize = 'both';
+    widget.style.width = `${size.width}px`;
+    widget.style.height = `${size.height}px`;
+    widget.style.minHeight = '260px';
+    widget.style.maxHeight = 'calc(100vh - 24px)';
+
+    if (document.body.contains(widget)) {
+        const rect = widget.getBoundingClientRect();
+        applyWidgetPosition(widget, rect.left, rect.top);
+    }
+}
+
 function makeDraggable(widget) {
     let dragging = false;
+    let resizing = false;
+    let didMove = false;
+    let pressTarget = null;
     let originX = 0;
     let originY = 0;
     let startLeft = 0;
@@ -427,8 +1100,16 @@ function makeDraggable(widget) {
     widget.addEventListener('mousedown', e => {
         if (e.button !== 0) return;
         if (closestFromEventTarget(e.target, '[data-lbh-close]')) return;
+        if (isWidgetResizeHandlePress(widget, e)) {
+            resizing = true;
+            widget.dataset.lbhResizing = 'true';
+            suppressNextWidgetToggle(widget, 700);
+            return;
+        }
         if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) return;
         dragging = true;
+        didMove = false;
+        pressTarget = e.target;
         originX = e.clientX;
         originY = e.clientY;
         const rect = widget.getBoundingClientRect();
@@ -441,18 +1122,77 @@ function makeDraggable(widget) {
 
     document.addEventListener('mousemove', e => {
         if (!dragging) return;
+        if (Math.abs(e.clientX - originX) > 3 || Math.abs(e.clientY - originY) > 3) {
+            didMove = true;
+        }
         const x = startLeft + (e.clientX - originX);
         const y = startTop + (e.clientY - originY);
         applyWidgetPosition(widget, x, y);
     });
 
     document.addEventListener('mouseup', e => {
+        if (resizing) {
+            resizing = false;
+            delete widget.dataset.lbhResizing;
+            persistWidgetExpandedSize(widget);
+            suppressNextWidgetToggle(widget);
+            return;
+        }
+
         if (!dragging) return;
+        const shouldToggle = !didMove && shouldToggleTranscriptFromWidgetTarget(pressTarget, widget, e.clientX, e.clientY, false);
         dragging = false;
+        pressTarget = null;
         widget.style.userSelect = '';
         // Persist position so it survives page reloads
         const rect = widget.getBoundingClientRect();
         chrome.storage.local.set({ _lbhWidgetX: rect.left, _lbhWidgetY: rect.top });
+        if (shouldToggle) {
+            suppressNextWidgetToggle(widget);
+            toggleTranscriptPanel();
+        } else if (didMove) {
+            suppressNextWidgetToggle(widget);
+        }
+    });
+}
+
+function shouldToggleTranscriptFromWidgetTarget(target, widget, clientX, clientY, respectSkip = true) {
+    if (!widget || (respectSkip && widget.dataset.lbhSkipToggleClick === 'true')) return false;
+    if (isWidgetResizeHandlePress(widget, { clientX, clientY })) {
+        suppressNextWidgetToggle(widget);
+        return false;
+    }
+    if (closestFromEventTarget(target, '[data-lbh-action]')) return false;
+    if (closestFromEventTarget(target, '[data-lbh-close]')) return false;
+    if (closestFromEventTarget(target, '[data-lbh-selectable]')) return false;
+    if (closestFromEventTarget(target, 'button,input,textarea,select,a,[contenteditable="true"]')) return false;
+
+    const selection = window.getSelection && window.getSelection();
+    if (selection && !selection.isCollapsed) return false;
+
+    return true;
+}
+
+function shouldToggleTranscriptFromWidgetClick(e, widget) {
+    return shouldToggleTranscriptFromWidgetTarget(e.target, widget, e.clientX, e.clientY);
+}
+
+function protectTranscriptTextareaEvents(widget) {
+    if (!widget) return;
+
+    widget.querySelectorAll('[data-lbh-selectable]').forEach(textarea => {
+        if (textarea.dataset.lbhProtected === 'true') return;
+        textarea.dataset.lbhProtected = 'true';
+
+        ['pointerdown', 'mousedown', 'mouseup', 'click', 'dblclick', 'selectstart'].forEach(type => {
+            textarea.addEventListener(type, e => {
+                e.stopPropagation();
+            });
+        });
+
+        textarea.addEventListener('wheel', e => {
+            e.stopPropagation();
+        }, { passive: true });
     });
 }
 
@@ -477,19 +1217,26 @@ function ensureWordCountWidget() {
         'cursor:grab',
         'box-shadow:0 2px 8px rgba(0,0,0,0.4)',
         'line-height:1.4',
-        'user-select:none',
-        'max-width:min(520px, calc(100vw - 24px))',
+        'user-select:auto',
+        `width:${WIDGET_COLLAPSED_WIDTH_PX}px`,
+        'min-width:260px',
+        'min-height:0',
+        'max-width:calc(100vw - 24px)',
         'max-height:min(80vh, calc(100vh - 24px))',
+        'box-sizing:border-box',
+        'resize:none',
         'overflow:auto'
     ].join(';');
 
     makeDraggable(wordCountWidget);
 
     wordCountWidget.addEventListener('pointerdown', e => {
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
         handleWidgetActionPress(e);
     }, true);
     wordCountWidget.addEventListener('mousedown', e => {
         if (handleWidgetActionPress(e)) return;
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
 
         if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) {
             e.stopImmediatePropagation();
@@ -497,10 +1244,26 @@ function ensureWordCountWidget() {
     }, true);
     wordCountWidget.addEventListener('click', e => {
         if (suppressWidgetActionClick(e)) return;
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
+        if (shouldToggleTranscriptFromWidgetClick(e, wordCountWidget)) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            toggleTranscriptPanel();
+            return;
+        }
         if (closestFromEventTarget(e.target, '[data-lbh-nodrag]')) {
             e.stopImmediatePropagation();
         }
     }, true);
+    wordCountWidget.addEventListener('dblclick', e => {
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
+    }, true);
+    wordCountWidget.addEventListener('selectstart', e => {
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
+    }, true);
+    wordCountWidget.addEventListener('wheel', e => {
+        if (closestFromEventTarget(e.target, '[data-lbh-selectable]')) return;
+    }, { capture: true, passive: true });
 
     wordCountWidget.addEventListener('mouseover', e => {
         const closeButton = closestFromEventTarget(e.target, '[data-lbh-close]');
@@ -512,7 +1275,15 @@ function ensureWordCountWidget() {
     });
 
     // Restore saved position if available
-    chrome.storage.local.get(['_lbhWidgetX', '_lbhWidgetY'], saved => {
+    chrome.storage.local.get([
+        '_lbhWidgetX',
+        '_lbhWidgetY',
+        '_lbhWidgetExpandedWidth',
+        '_lbhWidgetExpandedHeight'
+    ], saved => {
+        widgetExpandedSize = clampWidgetExpandedSize(saved._lbhWidgetExpandedWidth, saved._lbhWidgetExpandedHeight);
+        applyWidgetSizeMode(wordCountWidget);
+
         if (saved._lbhWidgetX !== undefined && saved._lbhWidgetY !== undefined) {
             applyWidgetPosition(wordCountWidget, saved._lbhWidgetX, saved._lbhWidgetY);
         }
@@ -541,6 +1312,7 @@ function getLocalCounts() {
     let words = 0;
     let segments = 0;
     targets.forEach(el => {
+        if (isTranscriptDisplayTextarea(el)) return;
         const text = el.value || el.textContent || '';
         if (!text.trim()) return;
         words += countWordsInText(text);
@@ -572,13 +1344,79 @@ function extractTtMsFromTimestamps() {
     return found ? totalMs : -1;
 }
 
+function getTranscriptTextForCopy(side) {
+    const snapshot = side === 'before' ? transcriptionCapture.before : transcriptionCapture.after;
+    return (snapshot ? (snapshot.displayText || snapshot.text || '') : '').trim();
+}
+
+function fallbackCopyText(text) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;pointer-events:none;';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+
+    try {
+        document.execCommand('copy');
+    } finally {
+        textarea.remove();
+    }
+}
+
+async function writeTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return;
+    }
+    fallbackCopyText(text);
+}
+
+function markTranscriptCopied(side) {
+    if (transcriptCopyStatus.timer) clearTimeout(transcriptCopyStatus.timer);
+    transcriptCopyStatus = {
+        side,
+        at: Date.now(),
+        timer: setTimeout(() => {
+            if (transcriptCopyStatus.side === side) {
+                transcriptCopyStatus = { side: '', at: 0, timer: null };
+                if (settings.enabled) updateWordCount();
+            }
+        }, 1200)
+    };
+    if (settings.enabled) updateWordCount();
+}
+
+async function copyTranscriptSection(side) {
+    const text = getTranscriptTextForCopy(side);
+    if (!text) return;
+
+    try {
+        await writeTextToClipboard(text);
+        markTranscriptCopied(side);
+    } catch (_) {
+        fallbackCopyText(text);
+        markTranscriptCopied(side);
+    }
+}
+
 function renderTranscriptSection(label, text, accentColor, highlightedHtml = '') {
     const hasText = !!text;
-    const bodyHtml = highlightedHtml || (hasText ? escapeHtml(text) : 'Waiting for transcription capture...');
+    const textareaText = hasText ? text : 'Waiting for transcription capture...';
+    const side = label.toLowerCase();
+    const canCopy = side === 'before' || side === 'after';
+    const copied = canCopy && transcriptCopyStatus.side === side && Date.now() - transcriptCopyStatus.at < 1200;
+    const copyButton = canCopy
+        ? `<button data-lbh-nodrag data-lbh-action="copy-${side}" ${hasText ? '' : 'disabled'} style="background:${copied ? '#166534' : '#1e293b'};color:#e5e7eb;border:1px solid ${copied ? '#22c55e' : '#475569'};border-radius:4px;padding:2px 8px;font:inherit;font-size:12px;cursor:${hasText ? 'pointer' : 'not-allowed'};opacity:${hasText ? '1' : '0.55'};">${copied ? 'Copied' : 'Copy'}</button>`
+        : '';
     return (
         `<div data-lbh-nodrag style="margin-top:8px;">` +
-            `<div style="color:${accentColor};font-weight:600;margin-bottom:4px;">${label}</div>` +
-            `<div style="background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;word-break:break-word;max-height:140px;overflow:auto;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;">${bodyHtml}</div>` +
+            `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:4px;">` +
+                `<div style="color:${accentColor};font-weight:600;">${label}</div>` +
+                copyButton +
+            '</div>' +
+            `<div data-lbh-selectable tabindex="0" aria-label="${escapeHtml(label)} transcript" style="display:block;width:100%;height:140px;box-sizing:border-box;background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;overflow:auto;overscroll-behavior:contain;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;-webkit-user-select:text;font:inherit;line-height:1.4;outline:none;pointer-events:auto;position:relative;z-index:2;touch-action:auto;">${highlightedHtml || escapeHtml(textareaText)}</div>` +
         '</div>'
     );
 }
@@ -697,12 +1535,15 @@ function runWidgetAction(action) {
     lastWidgetActionAt = now;
 
     if (action === 'toggle-transcript') {
-        transcriptPanelExpanded = !transcriptPanelExpanded;
-        if (settings.enabled) updateWordCount();
+        toggleTranscriptPanel();
     } else if (action === 'open-reference') {
         openReferenceModal();
     } else if (action === 'close-reference') {
         closeReferenceModal();
+    } else if (action === 'copy-before') {
+        copyTranscriptSection('before');
+    } else if (action === 'copy-after') {
+        copyTranscriptSection('after');
     }
 }
 
@@ -740,7 +1581,7 @@ function getAccuracyColor(accuracyPct) {
 }
 
 function getAccuracyNoteHtml() {
-    return '<div style="color:#94a3b8;font-size:12px;line-height:1.35;max-width:260px;white-space:normal;overflow-wrap:anywhere;margin:2px auto 0;">Format errors also reduce total accuracy. Missing periods and commas do not.</div>';
+    return '<div style="color:#94a3b8;font-size:12px;line-height:1.35;max-width:260px;white-space:normal;overflow-wrap:anywhere;margin:2px auto 0;">Format errors also reduce total accuracy. Missing periods, commas, and speaker role mistakes do not.</div>';
 }
 
 function ensureReferenceModal() {
@@ -849,36 +1690,33 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
         '<div data-lbh-nodrag style="margin-top:10px;padding-top:8px;border-top:1px solid #334155;">' +
             '<div style="color:#cbd5e1;font-weight:700;letter-spacing:0.02em;">Transcription</div>' +
         '</div>' +
-        renderTranscriptSection('Before', transcriptionCapture.before ? transcriptionCapture.before.text : '', '#f59e0b') +
-        renderTranscriptSection('After', transcriptionCapture.after ? transcriptionCapture.after.text : '', '#22c55e');
+        renderTranscriptSection('Before', transcriptionCapture.before ? (transcriptionCapture.before.displayText || transcriptionCapture.before.text) : '', '#f59e0b') +
+        renderTranscriptSection('After', transcriptionCapture.after ? (transcriptionCapture.after.displayText || transcriptionCapture.after.text) : '', '#22c55e');
 
-    widget.innerHTML = html;
+    if (html !== lastRenderedWidgetHtml) {
+        widget.innerHTML = html;
+        lastRenderedWidgetHtml = html;
+        protectTranscriptTextareaEvents(widget);
+    }
     widget.style.display = '';
 }
 
 function renderWordCountWidget(totalWords, totalSegments, totalMs) {
     if (widgetDismissed) return;
     const widget = ensureWordCountWidget();
+    applyWidgetSizeMode(widget);
     const dot = '<span style="color:#9ca3af;margin:0 5px;">&middot;</span>';
-    const summaryAlign = transcriptPanelExpanded ? 'center' : 'left';
-    let html =
-        `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">` +
-            `<div style="flex:1;text-align:${summaryAlign};">` +
-                '<span style="color:#e5e7eb;margin-right:4px;">Words</span>' +
-                `<span style="color:#3b82f6;font-weight:600;">${totalWords.toLocaleString()}</span>` +
-                dot +
-                '<span style="color:#e5e7eb;margin-right:4px;">Segments</span>' +
-                `<span style="color:#ffffff;margin-right:8px;">${totalSegments}</span>`;
+    const summaryAlign = 'center';
+    let summaryHtml = '';
 
     if (totalMs > 0) {
-        html +=
-            '<br>' +
+        summaryHtml +=
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
         if (selectionDurationMs >= 0) {
             const pct = (selectionDurationMs / totalMs * 100).toFixed(1);
-            html +=
+            summaryHtml +=
                 dot +
                 '<span style="color:#e5e7eb;margin-right:4px;">Sel</span>' +
                 `<span style="color:#a78bfa;font-weight:600;">${formatDuration(selectionDurationMs)}</span>` +
@@ -886,7 +1724,7 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
                 `<span style="color:#a78bfa;">${pct}%</span>`;
         } else {
             const fivePercMs = totalMs * 0.05;
-            html +=
+            summaryHtml +=
                 dot +
                 '<span style="color:#e5e7eb;margin-right:4px;">5%</span>' +
                 `<span style="color:#f59e0b;font-weight:600;">${formatDuration(fivePercMs)}</span>`;
@@ -895,8 +1733,8 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
 
     if (transcriptionCapture.metrics) {
         const accuracyColor = getAccuracyColor(transcriptionCapture.metrics.totalAccuracyPct);
-        html +=
-            '<br>' +
+        summaryHtml +=
+            (summaryHtml ? '<br>' : '') +
             '<span style="color:#e5e7eb;margin-right:4px;">Acc</span>' +
             `<span style="color:${accuracyColor};font-weight:600;">${transcriptionCapture.metrics.totalAccuracyPct.toFixed(1)}%</span>` +
             dot +
@@ -905,18 +1743,25 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
             getAccuracyNoteHtml();
     }
 
-    html +=
+    if (!summaryHtml) {
+        summaryHtml = '<span style="color:#94a3b8;">Click to show transcription</span>';
+    }
+
+    let html =
+        `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">` +
+            `<div style="flex:1;text-align:${summaryAlign};">` +
+                summaryHtml +
             '</div>' +
             '<button data-lbh-close data-lbh-nodrag style="color:#e5e7eb;cursor:pointer;padding:0 2px;border-radius:3px;font-size:16px;line-height:1;background:transparent;border:none;" title="Hide badge (click extension icon to restore)">&times;</button>' +
         '</div>' +
-        `<div data-lbh-nodrag style="display:flex;justify-content:${transcriptPanelExpanded ? 'center' : 'flex-start'};gap:8px;flex-wrap:wrap;margin-top:10px;">` +
+        '<div data-lbh-nodrag style="display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:10px;">' +
             renderWidgetButton(transcriptPanelExpanded ? 'Hide Transcript' : 'Show Transcript', 'toggle-transcript', transcriptPanelExpanded) +
             renderWidgetButton('Rating Criteria', 'open-reference') +
         '</div>';
 
     if (transcriptPanelExpanded) {
-        const beforeText = transcriptionCapture.before ? transcriptionCapture.before.text : '';
-        const afterText = transcriptionCapture.after ? transcriptionCapture.after.text : '';
+        const beforeText = transcriptionCapture.before ? (transcriptionCapture.before.displayText || transcriptionCapture.before.text) : '';
+        const afterText = transcriptionCapture.after ? (transcriptionCapture.after.displayText || transcriptionCapture.after.text) : '';
         const diffHtml = buildTranscriptDiffHighlights(beforeText, afterText);
         html +=
             '<div data-lbh-nodrag style="margin-top:10px;padding-top:8px;border-top:1px solid #334155;">' +
@@ -926,7 +1771,11 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
             renderTranscriptSection('After', afterText, '#22c55e', diffHtml.afterHtml);
     }
 
-    widget.innerHTML = html;
+    if (html !== lastRenderedWidgetHtml) {
+        widget.innerHTML = html;
+        lastRenderedWidgetHtml = html;
+        protectTranscriptTextareaEvents(widget);
+    }
     widget.style.display = '';
 }
 
@@ -952,7 +1801,7 @@ function updateWordCount() {
         const local = getLocalCounts();
         const container = getTimelineContainer();
         const containerWidth = container ? container.getBoundingClientRect().width : 0;
-        if (containerWidth !== updateWordCount._lastLoggedWidth) {
+        if (DEBUG_LOGS && containerWidth !== updateWordCount._lastLoggedWidth) {
             updateWordCount._lastLoggedWidth = containerWidth;
             console.log('[LBH] waveform container width px:', containerWidth);
         }
@@ -1038,14 +1887,17 @@ function sanitizeStringArray(value, fallback) {
 }
 
 function normalizeSettings(raw) {
+    const wordsToHighlight = sanitizeStringArray(raw.wordsToHighlight, DEFAULT_SETTINGS.wordsToHighlight);
+    const wordsToHighlightCaseSensitive = sanitizeStringArray(raw.wordsToHighlightCaseSensitive, DEFAULT_SETTINGS.wordsToHighlightCaseSensitive);
+
     return {
         enabled: true,
         enableCaseInsensitiveWords: raw.enableCaseInsensitiveWords !== false,
         enableCaseSensitiveWords: raw.enableCaseSensitiveWords !== false,
         enablePunctuation: raw.enablePunctuation !== false,
         enableOrangeAngle: raw.enableOrangeAngle !== false,
-        wordsToHighlight: sanitizeStringArray(raw.wordsToHighlight, DEFAULT_SETTINGS.wordsToHighlight),
-        wordsToHighlightCaseSensitive: sanitizeStringArray(raw.wordsToHighlightCaseSensitive, DEFAULT_SETTINGS.wordsToHighlightCaseSensitive),
+        wordsToHighlight: wordsToHighlight.length ? wordsToHighlight : [...DEFAULT_SETTINGS.wordsToHighlight],
+        wordsToHighlightCaseSensitive: wordsToHighlightCaseSensitive.length ? wordsToHighlightCaseSensitive : [...DEFAULT_SETTINGS.wordsToHighlightCaseSensitive],
         remoteRemoved: sanitizeStringArray(raw.remoteRemoved, []),
         remoteCommunityAudit: sanitizeStringArray(raw.remoteCommunityAudit, []),
         remoteSrFlag: sanitizeStringArray(raw.remoteSrFlag, [])
@@ -1248,9 +2100,9 @@ function logHighlightChangeIfNeeded(targetElement, isHighlighted, triggeredToken
     const changed = previousState !== isHighlighted || previousSignature !== currentSignature;
 
     if (changed) {
-        if (isHighlighted) {
+        if (DEBUG_LOGS && isHighlighted) {
             console.log("Highlighter: Triggered tokens:", triggeredTokens);
-        } else if (previousState) {
+        } else if (DEBUG_LOGS && previousState) {
             console.log("Highlighter: Highlight cleared");
         }
     }
@@ -1403,7 +2255,7 @@ function highlightPageText(matchers) {
             const el = node.parentElement;
             if (!el) return NodeFilter.FILTER_REJECT;
             if (SKIP_TAGS.has(el.tagName)) return NodeFilter.FILTER_REJECT;
-            if (el.closest('[contenteditable="true"]') || el.id === 'lbh-word-count') return NodeFilter.FILTER_REJECT;
+            if (el.closest('[contenteditable="true"]') || el.closest('#lbh-word-count')) return NodeFilter.FILTER_REJECT;
             if (el.classList.contains(COMMUNITY_HIGHLIGHT_CLASS)) return NodeFilter.FILTER_REJECT;
             if (!node.textContent.trim()) return NodeFilter.FILTER_SKIP;
             return NodeFilter.FILTER_ACCEPT;
@@ -1472,6 +2324,7 @@ function clearAllHighlights() {
     });
 
     hideWordCountWidget();
+    lastRenderedWidgetHtml = '';
 }
 
 function getParentContainer(field, isVisItemContentDiv) {
@@ -1518,6 +2371,11 @@ function hasSquareBracketMatch(text) {
 }
 
 function processTextarea(field, text, matchers) {
+    if (isTranscriptDisplayTextarea(field)) {
+        clearTextareaOverlay(field);
+        return;
+    }
+
     const result = buildHighlightedHtml(text, matchers, settings);
     const triggeredTokens = result.hasMatch
         ? getTriggeredTokens(text, matchers, settings)
@@ -1526,8 +2384,14 @@ function processTextarea(field, text, matchers) {
     if (result.hasMatch) {
         const overlay = ensureTextareaOverlay(field);
         overlay.innerHTML = `${result.html}${text.endsWith('\n') ? '\n' : ''}`;
+        field.dataset.alerted = 'true';
     } else {
         clearTextareaOverlay(field);
+        if (field.dataset.alerted === 'true') {
+            field.style.outline = '';
+            field.style.borderRadius = '';
+            delete field.dataset.alerted;
+        }
     }
 
     logHighlightChangeIfNeeded(field, result.hasMatch, triggeredTokens, 'textarea');
@@ -1577,29 +2441,107 @@ function processVisItem(field, text, matchers) {
     logHighlightChangeIfNeeded(parentContainer, false, [], 'div');
 }
 
-function checkLabelbox(fullReset = false) {
+function getDirectHighlightOutline(text, matchers) {
+    const hasCaseInsensitiveMatch = matchers.caseInsensitiveTestRegex ? matchers.caseInsensitiveTestRegex.test(text) : false;
+    const hasCaseSensitiveMatch = matchers.caseSensitiveTestRegex ? matchers.caseSensitiveTestRegex.test(text) : false;
+    const hasRemovedMatch = matchers.removedTestRegex ? matchers.removedTestRegex.test(text) : false;
+    const hasCommunityAuditMatch = matchers.communityAuditTestRegex ? matchers.communityAuditTestRegex.test(text) : false;
+    const hasSrFlagMatch = matchers.srFlagTestRegex ? matchers.srFlagTestRegex.test(text) : false;
+    const angleMatchState = getAngleMatchState(text, settings);
+    const hasSquareBracketRedMatch = hasSquareBracketMatch(text);
+    const hasPunctuationRedMatch = settings.enablePunctuation && hasRelevantPunctuationMatch(text);
+    const hasRedBorderMatch = hasCaseInsensitiveMatch || hasCaseSensitiveMatch || hasPunctuationRedMatch || angleMatchState.hasRed || hasSquareBracketRedMatch;
+
+    if (hasRemovedMatch) return pinkBorderColor;
+    if (hasCommunityAuditMatch) return purpleBorderColor;
+    if (hasSrFlagMatch) return blueBorderColor;
+    if (hasRedBorderMatch) return redBorderColor;
+    if (angleMatchState.hasOrange) return orangeBorderColor;
+    return '';
+}
+
+function applyDirectHighlightFallback(field, text, matchers) {
+    if (isTranscriptDisplayTextarea(field) || isRoleComboboxTextarea(field)) {
+        if (field.dataset.alerted === 'true') {
+            field.style.outline = '';
+            field.style.borderRadius = '';
+            delete field.dataset.alerted;
+        }
+        return;
+    }
+    if (!text) return;
+
+    const outlineColor = getDirectHighlightOutline(text, matchers);
+    const target = field.matches('textarea') ? field : getParentContainer(field, true);
+
+    if (outlineColor && !field.matches('textarea')) {
+        target.style.setProperty('outline', outlineColor, 'important');
+        target.style.setProperty('border-radius', '3px', 'important');
+        target.dataset.alerted = 'true';
+        return;
+    }
+
+    if (target.dataset.alerted === 'true') {
+        target.style.outline = '';
+        target.style.borderRadius = '';
+        delete target.dataset.alerted;
+    }
+}
+
+function getHighlightTargets() {
+    return [
+        ...[...document.querySelectorAll('textarea')]
+            .filter(field => !isTranscriptDisplayTextarea(field) && !isRoleComboboxTextarea(field) && !field.closest('#lbh-word-count')),
+        ...document.querySelectorAll('div.vis-item-content')
+    ];
+}
+
+function runHighlightPass(fullReset = false) {
     if (!settings.enabled) return;
 
     if (fullReset) clearPageTextHighlights();
     const matchers = createMatcherSet(settings);
-    const elementsToCheck = document.querySelectorAll(TARGET_SELECTOR);
+    const elementsToCheck = getHighlightTargets();
 
     elementsToCheck.forEach(field => {
-        if (field.getAttribute('aria-hidden') === 'true') return;
+        try {
+            if (field.getAttribute('aria-hidden') === 'true') return;
 
-        const text = field.value || field.textContent || '';
-        const isTextarea = field.matches('textarea');
+            const text = field.value || field.textContent || '';
+            const isTextarea = field.matches('textarea');
 
-        if (isTextarea) {
-            processTextarea(field, text, matchers);
-            return;
+            if (isTextarea) {
+                processTextarea(field, text, matchers);
+                applyDirectHighlightFallback(field, text, matchers);
+                return;
+            }
+
+            processVisItem(field, text, matchers);
+            applyDirectHighlightFallback(field, text, matchers);
+        } catch (error) {
+            const fallbackText = field && (field.value || field.textContent || '');
+            if (fallbackText) applyDirectHighlightFallback(field, fallbackText, matchers);
+            if (DEBUG_LOGS) console.warn('[LBH] highlight scan skipped one field:', error);
         }
-
-        processVisItem(field, text, matchers);
     });
 
-    highlightPageText(matchers);
-    updateWordCount();
+    try {
+        highlightPageText(matchers);
+    } catch (error) {
+        if (DEBUG_LOGS) console.warn('[LBH] page text highlight failed:', error);
+    }
+}
+
+function checkLabelbox(fullReset = false) {
+    if (!settings.enabled) return;
+
+    runHighlightPass(fullReset);
+
+    try {
+        updateWordCount();
+    } catch (error) {
+        if (DEBUG_LOGS) console.warn('[LBH] widget update failed:', error);
+    }
 }
 
 function runCheckCycle() {
@@ -1631,26 +2573,68 @@ function scheduleCheck(forceReset = false) {
     });
 }
 
+function invalidateRoleCacheIfNeeded(target) {
+    if (getRoleValueControlFromNode(target)) {
+        speakerRoleAssignmentsCache = { rowKey: '', at: 0, map: new Map() };
+        return true;
+    }
+    return false;
+}
+
+function handlePageInputOrChange(e) {
+    const roleChanged = invalidateRoleCacheIfNeeded(e.target);
+    if (settings.enabled && (roleChanged || isTranscriptTextarea(e.target))) updateWordCount();
+    scheduleCheck();
+}
+
 function nodeContainsTarget(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
     if (node.matches(TARGET_SELECTOR)) return true;
     return node.querySelector(TARGET_SELECTOR) !== null;
 }
 
+function nodeContainsRoleValueControl(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+    if (getRoleValueControlFromNode(node)) return true;
+    return !!node.querySelector('textarea[role="combobox"],input[role="combobox"],textarea.MuiAutocomplete-input,input.MuiAutocomplete-input,select');
+}
+
 function shouldScheduleFromMutation(mutation) {
+    if (isWidgetNode(mutation.target)) return false;
+    if (invalidateRoleCacheIfNeeded(mutation.target)) return true;
+
     if (mutation.type === 'characterData') {
         const parent = mutation.target && mutation.target.parentElement;
+        if (isWidgetNode(parent)) return false;
         return !!(parent && parent.closest('div.vis-item-content'));
     }
 
     if (mutation.type === 'childList') {
+        for (const node of mutation.addedNodes) {
+            if (isWidgetNode(node)) continue;
+            if (nodeContainsRoleValueControl(node)) {
+                speakerRoleAssignmentsCache = { rowKey: '', at: 0, map: new Map() };
+                return true;
+            }
+        }
+
+        for (const node of mutation.removedNodes) {
+            if (isWidgetNode(node)) continue;
+            if (nodeContainsRoleValueControl(node)) {
+                speakerRoleAssignmentsCache = { rowKey: '', at: 0, map: new Map() };
+                return true;
+            }
+        }
+
         if (nodeContainsTarget(mutation.target)) return true;
 
         for (const node of mutation.addedNodes) {
+            if (isWidgetNode(node)) continue;
             if (nodeContainsTarget(node)) return true;
         }
 
         for (const node of mutation.removedNodes) {
+            if (isWidgetNode(node)) continue;
             if (nodeContainsTarget(node)) return true;
         }
 
@@ -1658,6 +2642,7 @@ function shouldScheduleFromMutation(mutation) {
         const hasCommunity = settings.remoteRemoved.length + settings.remoteCommunityAudit.length + settings.remoteSrFlag.length > 0;
         if (hasCommunity) {
             for (const node of mutation.addedNodes) {
+                if (isWidgetNode(node)) continue;
                 if (node.nodeType === Node.ELEMENT_NODE) return true;
             }
         }
@@ -1685,6 +2670,14 @@ function startDomObserver() {
     });
 }
 
+function startHighlightWatchdog() {
+    if (highlightWatchdog) return;
+    if (settings.enabled) runHighlightPass();
+    highlightWatchdog = window.setInterval(() => {
+        if (settings.enabled) runHighlightPass();
+    }, 1500);
+}
+
 // ── Timeline selection tracking ───────────────────────────────────────────────
 
 // Child frames track clicks and report selection up; top frame owns the state.
@@ -1700,6 +2693,8 @@ function publishSelectionDuration(durationMs) {
 }
 
 document.addEventListener('click', e => {
+    if (isTranscriptDisplayTextarea(e.target)) return;
+
     const container = getTimelineContainer();
     if (!container) return;
 
@@ -1786,6 +2781,7 @@ function loadSettingsAndApply() {
             clearAllHighlights();
             return;
         }
+        runHighlightPass(true);
         scheduleCheck(true);
     });
 }
@@ -1852,8 +2848,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 
 loadSettingsAndApply();
 startDomObserver();
-document.addEventListener('input', scheduleCheck);
-document.addEventListener('change', scheduleCheck);
+startHighlightWatchdog();
+document.addEventListener('input', handlePageInputOrChange);
+document.addEventListener('change', handlePageInputOrChange);
 
 // Keep our widget controls responsive even when Labelbox registers broad click handlers.
 document.addEventListener('pointerdown', handleWidgetActionPress, true);
@@ -1876,15 +2873,7 @@ document.addEventListener('click', e => {
     if (actionEl) {
         e.preventDefault();
         e.stopPropagation();
-        const action = actionEl.getAttribute('data-lbh-action');
-        if (action === 'toggle-transcript') {
-            transcriptPanelExpanded = !transcriptPanelExpanded;
-            if (settings.enabled) updateWordCount();
-        } else if (action === 'open-reference') {
-            openReferenceModal();
-        } else if (action === 'close-reference') {
-            closeReferenceModal();
-        }
+        runWidgetAction(actionEl.getAttribute('data-lbh-action'));
         return;
     }
 
