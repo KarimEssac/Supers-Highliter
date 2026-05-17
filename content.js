@@ -51,6 +51,7 @@ let lastSavedTranscriptionSignature = '';
 let speakerRoleAssignmentsCache = { rowKey: '', at: 0, map: new Map() };
 let transcriptCopyStatus = { side: '', at: 0, timer: null };
 let lastRenderedWidgetHtml = '';
+let transcriptRawTextCache = { rowKey: '', segments: new Map() };
 let widgetExpandedSize = {
     width: WIDGET_EXPANDED_DEFAULT_WIDTH_PX,
     height: WIDGET_EXPANDED_DEFAULT_HEIGHT_PX
@@ -96,6 +97,83 @@ function normalizeSegmentText(text) {
         .replace(/\u00a0/g, ' ')
         .replace(/\r\n/g, '\n')
         .trim();
+}
+
+function resetTranscriptRawTextCacheIfNeeded(rowKey = getCurrentDataRowKey()) {
+    if (transcriptRawTextCache.rowKey !== rowKey) {
+        transcriptRawTextCache = { rowKey, segments: new Map() };
+    }
+}
+
+function getTranscriptSegmentCacheKey(index, item = null) {
+    if (Number.isFinite(index) && index >= 0) return `idx:${index}`;
+    if (!item) return '';
+
+    const sortKey = getTimelineItemSortKey(item);
+    if (!Number.isFinite(sortKey.x) || !Number.isFinite(sortKey.y)) return '';
+    return `pos:${Math.round(sortKey.x)}:${Math.round(sortKey.y)}`;
+}
+
+function hasLiteralAngleText(text) {
+    return /[<>]/.test(String(text || ''));
+}
+
+function normalizeAngleLossyText(text) {
+    return normalizeSegmentText(text)
+        .replace(/[<>]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function countLiteralAngleDelimiters(text) {
+    const matches = String(text || '').match(/[<>]/g);
+    return matches ? matches.length : 0;
+}
+
+function shouldPreferCachedTranscriptText(cachedText, domText) {
+    const cached = normalizeSegmentText(cachedText);
+    if (!cached) return false;
+
+    const fallback = normalizeSegmentText(domText);
+    if (!fallback) return true;
+    if (cached === fallback) return true;
+    if (!hasLiteralAngleText(cached) || countLiteralAngleDelimiters(cached) <= countLiteralAngleDelimiters(fallback)) {
+        return false;
+    }
+
+    const cachedLossy = normalizeAngleLossyText(cached);
+    const fallbackLossy = normalizeAngleLossyText(fallback);
+    return !fallbackLossy || cachedLossy === fallbackLossy || cachedLossy.includes(fallbackLossy) || fallbackLossy.includes(cachedLossy);
+}
+
+function rememberRawTranscriptText(key, text, options = {}) {
+    const normalized = normalizeSegmentText(text);
+    if (!key || !normalized || /^\d{1,2}$/.test(normalized)) return;
+
+    resetTranscriptRawTextCacheIfNeeded();
+
+    const entry = transcriptRawTextCache.segments.get(key) || { initialText: '', currentText: '' };
+    if (options.initial && !entry.initialText) {
+        entry.initialText = normalized;
+    }
+    if (options.current !== false) {
+        entry.currentText = normalized;
+    }
+    transcriptRawTextCache.segments.set(key, entry);
+}
+
+function getCachedTranscriptText(key, domText, mode = 'initial') {
+    resetTranscriptRawTextCacheIfNeeded();
+
+    const entry = transcriptRawTextCache.segments.get(key);
+    if (!entry) return domText;
+
+    const cached = mode === 'current'
+        ? (entry.currentText || entry.initialText)
+        : (entry.initialText || '');
+
+    return shouldPreferCachedTranscriptText(cached, domText) ? cached : domText;
 }
 
 function isElementVisible(el) {
@@ -152,6 +230,16 @@ function getSavedTranscriptElements() {
         .sort(compareTranscriptElementsByTimeline);
 }
 
+function getReadableTranscriptElementText(el, cacheMode = 'current') {
+    const domText = el && (el.value || el.textContent || '') || '';
+    if (!el || !el.matches || !el.matches('div.vis-item-content') || !cacheMode) return domText;
+
+    const savedElements = getSavedTranscriptElements();
+    const index = savedElements.indexOf(el);
+    const key = getTranscriptSegmentCacheKey(index, getTimelineItemForElement(el));
+    return key ? getCachedTranscriptText(key, domText, cacheMode) : domText;
+}
+
 function isRoleComboboxTextarea(el) {
     if (!el || !el.matches || !el.matches('textarea')) return false;
     const role = el.getAttribute('role') || '';
@@ -195,6 +283,38 @@ function getActiveTranscriptTextarea() {
     if (!isTranscriptTextarea(active)) return null;
     if (active.getAttribute('aria-hidden') === 'true' || !isElementVisible(active)) return null;
     return active;
+}
+
+function getSelectedSavedTranscriptIndex(savedElements = getSavedTranscriptElements()) {
+    const selectedContent = document.querySelector('.vis-item.vis-selected div.vis-item-content')
+        || document.querySelector('.vis-item.vis-selected [aria-hidden="false"].vis-item-content')
+        || document.querySelector('.vis-item.vis-selected .vis-item-content');
+    return selectedContent ? savedElements.indexOf(selectedContent) : -1;
+}
+
+function getTextareaSegmentCacheKey(textarea, savedElements = getSavedTranscriptElements()) {
+    const selectedIndex = getSelectedSavedTranscriptIndex(savedElements);
+    if (selectedIndex >= 0) return getTranscriptSegmentCacheKey(selectedIndex);
+
+    const item = getTimelineItemForElement(textarea) || document.querySelector('.vis-item.vis-selected');
+    const itemContent = item && item.querySelector
+        ? (item.querySelector('div.vis-item-content') || item.querySelector('.vis-item-content'))
+        : null;
+    const itemIndex = itemContent ? savedElements.indexOf(itemContent) : -1;
+    if (itemIndex >= 0) return getTranscriptSegmentCacheKey(itemIndex);
+
+    if (savedElements.length === 1) return getTranscriptSegmentCacheKey(0);
+    return getTranscriptSegmentCacheKey(-1, item);
+}
+
+function rememberTranscriptTextareaValue(textarea, options = {}) {
+    if (!isTranscriptTextarea(textarea)) return;
+    if (textarea.getAttribute('aria-hidden') === 'true' || !isElementVisible(textarea)) return;
+
+    const key = getTextareaSegmentCacheKey(textarea);
+    if (!key) return;
+
+    rememberRawTranscriptText(key, textarea.value || '', options);
 }
 
 function normalizeSpeakerRole(role) {
@@ -569,16 +689,18 @@ function getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers) {
     return roleMap.get(speakerNumber) || '';
 }
 
-function getSavedTranscriptSegments(savedElements = getSavedTranscriptElements()) {
+function getSavedTranscriptSegments(savedElements = getSavedTranscriptElements(), cacheMode = 'initial') {
     const roleMap = getSpeakerRoleAssignments();
     const timelineItems = getVisibleTranscriptTimelineItems(savedElements.map(getTimelineItemForElement), savedElements);
     const itemSpeakerNumbers = getSpeakerNumbersForTimelineItems(timelineItems);
 
-    return savedElements.map(el => {
+    return savedElements.map((el, index) => {
         const item = getTimelineItemForElement(el);
         const speakerNumber = itemSpeakerNumbers.get(item) || null;
+        const domText = el.textContent || '';
+        const cacheKey = getTranscriptSegmentCacheKey(index, item);
         return {
-            text: el.textContent || '',
+            text: cacheMode ? getCachedTranscriptText(cacheKey, domText, cacheMode) : domText,
             role: getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers),
             speakerNumber
         };
@@ -649,7 +771,7 @@ function buildSavedTranscriptSnapshot() {
 
 function buildLiveTranscriptSnapshot() {
     const savedElements = getSavedTranscriptElements();
-    const savedSegments = getSavedTranscriptSegments(savedElements);
+    const savedSegments = getSavedTranscriptSegments(savedElements, 'current');
     const activeTextarea = getActiveTranscriptTextarea();
 
     if (savedSegments.length > 0) {
@@ -660,10 +782,11 @@ function buildLiveTranscriptSnapshot() {
         }));
         if (activeTextarea) {
             const liveText = normalizeSegmentText(activeTextarea.value || '');
-            const selectedContent = document.querySelector('.vis-item.vis-selected div.vis-item-content')
-                || document.querySelector('.vis-item.vis-selected [aria-hidden="false"].vis-item-content')
-                || document.querySelector('.vis-item.vis-selected .vis-item-content');
-            const selectedIndex = selectedContent ? savedElements.indexOf(selectedContent) : -1;
+            const selectedIndex = getSelectedSavedTranscriptIndex(savedElements);
+            const cacheKey = selectedIndex >= 0
+                ? getTranscriptSegmentCacheKey(selectedIndex)
+                : getTextareaSegmentCacheKey(activeTextarea, savedElements);
+            rememberRawTranscriptText(cacheKey, liveText, { current: true });
 
             if (liveText) {
                 const savedText = selectedIndex >= 0 ? normalizeSegmentText(mergedSegments[selectedIndex].text) : '';
@@ -800,6 +923,28 @@ function snapshotNeedsMissingRoleBackfill(snapshot) {
     ));
 }
 
+function getSnapshotSegmentText(snapshot) {
+    return (snapshot && snapshot.segments ? snapshot.segments : [])
+        .map(segment => normalizeSegmentText(segment))
+        .join('\n');
+}
+
+function shouldUpgradeSnapshotWithLiteralAngles(existingSnapshot, candidateSnapshot) {
+    if (!existingSnapshot || !candidateSnapshot) return false;
+    if (existingSnapshot.segmentCount !== candidateSnapshot.segmentCount) return false;
+
+    const existingText = getSnapshotSegmentText(existingSnapshot);
+    const candidateText = getSnapshotSegmentText(candidateSnapshot);
+    if (countLiteralAngleDelimiters(candidateText) <= countLiteralAngleDelimiters(existingText)) return false;
+
+    const existingLossy = normalizeAngleLossyText(existingText);
+    const candidateLossy = normalizeAngleLossyText(candidateText);
+    return !existingLossy
+        || candidateLossy === existingLossy
+        || candidateLossy.includes(existingLossy)
+        || existingLossy.includes(candidateLossy);
+}
+
 function fillMissingRoleAssignmentsInSnapshot(snapshot) {
     if (!snapshotNeedsMissingRoleBackfill(snapshot)) return snapshot;
 
@@ -902,6 +1047,7 @@ function updateTranscriptionCapture() {
         transcriptionCapture = { rowKey, before: null, after: null, metrics: null };
         childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
         lastSavedTranscriptionSignature = '';
+        resetTranscriptRawTextCacheIfNeeded(rowKey);
     }
 
     const beforeSnapshot = getPreferredSavedTranscriptSnapshot();
@@ -913,6 +1059,8 @@ function updateTranscriptionCapture() {
     }
 
     if (!transcriptionCapture.before && beforeSnapshot) {
+        transcriptionCapture.before = cloneTranscriptSnapshot(beforeSnapshot);
+    } else if (beforeSnapshot && shouldUpgradeSnapshotWithLiteralAngles(transcriptionCapture.before, beforeSnapshot)) {
         transcriptionCapture.before = cloneTranscriptSnapshot(beforeSnapshot);
     } else if (snapshotNeedsMissingRoleBackfill(transcriptionCapture.before)) {
         transcriptionCapture.before = cloneTranscriptSnapshot(
@@ -1313,7 +1461,7 @@ function getLocalCounts() {
     let segments = 0;
     targets.forEach(el => {
         if (isTranscriptDisplayTextarea(el)) return;
-        const text = el.value || el.textContent || '';
+        const text = getReadableTranscriptElementText(el, 'current');
         if (!text.trim()) return;
         words += countWordsInText(text);
         segments += 1;
@@ -1401,9 +1549,8 @@ async function copyTranscriptSection(side) {
     }
 }
 
-function renderTranscriptSection(label, text, accentColor, highlightedHtml = '') {
+function renderTranscriptSection(label, text, accentColor) {
     const hasText = !!text;
-    const textareaText = hasText ? text : 'Waiting for transcription capture...';
     const side = label.toLowerCase();
     const canCopy = side === 'before' || side === 'after';
     const copied = canCopy && transcriptCopyStatus.side === side && Date.now() - transcriptCopyStatus.at < 1200;
@@ -1416,7 +1563,7 @@ function renderTranscriptSection(label, text, accentColor, highlightedHtml = '')
                 `<div style="color:${accentColor};font-weight:600;">${label}</div>` +
                 copyButton +
             '</div>' +
-            `<div data-lbh-selectable tabindex="0" aria-label="${escapeHtml(label)} transcript" style="display:block;width:100%;height:140px;box-sizing:border-box;background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;overflow:auto;overscroll-behavior:contain;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;-webkit-user-select:text;font:inherit;line-height:1.4;outline:none;pointer-events:auto;position:relative;z-index:2;touch-action:auto;">${highlightedHtml || escapeHtml(textareaText)}</div>` +
+            `<div data-lbh-selectable data-lbh-transcript-body="${side}" tabindex="0" aria-label="${escapeHtml(label)} transcript" style="display:block;width:100%;height:140px;box-sizing:border-box;background:rgba(15,23,42,0.88);border:1px solid #334155;border-left:4px solid ${accentColor};border-radius:4px;padding:6px 8px;white-space:pre-wrap;overflow:auto;overscroll-behavior:contain;color:${hasText ? '#e5e7eb' : '#94a3b8'};cursor:text;user-select:text;-webkit-user-select:text;font:inherit;line-height:1.4;outline:none;pointer-events:auto;position:relative;z-index:2;touch-action:auto;"></div>` +
         '</div>'
     );
 }
@@ -1493,8 +1640,8 @@ function buildTranscriptDiffHighlights(beforeText, afterText) {
     });
 
     return {
-        beforeHtml: renderTranscriptWithTokenHighlights(beforeText, beforeTokens, beforeFlags),
-        afterHtml: renderTranscriptWithTokenHighlights(afterText, afterTokens, afterFlags)
+        before: { text: beforeText, tokens: beforeTokens, flags: beforeFlags },
+        after: { text: afterText, tokens: afterTokens, flags: afterFlags }
     };
 }
 
@@ -1505,18 +1652,58 @@ function getTokenHighlightStyle(flag) {
     return '';
 }
 
-function renderTranscriptWithTokenHighlights(text, tokens, flags) {
-    let html = '';
+function appendTranscriptWithTokenHighlights(container, text, tokens, flags) {
     let cursor = 0;
     tokens.forEach((token, index) => {
-        html += escapeHtml(String(text || '').slice(cursor, token.start));
+        container.appendChild(document.createTextNode(String(text || '').slice(cursor, token.start)));
         const style = getTokenHighlightStyle(flags[index]);
-        const tokenHtml = escapeHtml(String(text || '').slice(token.start, token.end));
-        html += style ? `<span style="${style}">${tokenHtml}</span>` : tokenHtml;
+        const tokenText = String(text || '').slice(token.start, token.end);
+        if (style) {
+            const span = document.createElement('span');
+            span.style.cssText = style;
+            span.textContent = tokenText;
+            container.appendChild(span);
+        } else {
+            container.appendChild(document.createTextNode(tokenText));
+        }
         cursor = token.end;
     });
-    html += escapeHtml(String(text || '').slice(cursor));
-    return html;
+    container.appendChild(document.createTextNode(String(text || '').slice(cursor)));
+}
+
+function getTranscriptSectionSignature(section) {
+    const highlight = section.highlight || {};
+    return [
+        section.text || '',
+        (highlight.tokens || []).map(token => `${token.start}:${token.end}`).join(','),
+        (highlight.flags || []).join(',')
+    ].join('\u241f');
+}
+
+function populateTranscriptSections(widget, sections) {
+    if (!widget || !sections || sections.length === 0) return;
+
+    sections.forEach(section => {
+        const body = widget.querySelector(`[data-lbh-transcript-body="${section.side}"]`);
+        if (!body) return;
+
+        const signature = getTranscriptSectionSignature(section);
+        if (body.dataset.lbhTranscriptSignature === signature) return;
+
+        body.replaceChildren();
+        if (!section.text) {
+            body.appendChild(document.createTextNode('Waiting for transcription capture...'));
+            body.dataset.lbhTranscriptSignature = signature;
+            return;
+        }
+
+        if (section.highlight) {
+            appendTranscriptWithTokenHighlights(body, section.text, section.highlight.tokens || [], section.highlight.flags || []);
+        } else {
+            body.appendChild(document.createTextNode(section.text));
+        }
+        body.dataset.lbhTranscriptSignature = signature;
+    });
 }
 
 function renderWidgetButton(label, action, isActive = false) {
@@ -1642,7 +1829,13 @@ function openReferenceModal() {
 function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
     if (widgetDismissed) return;
     const widget = ensureWordCountWidget();
-    const dot = '<span style="color:#9ca3af;margin:0 5px;">·</span>';
+    const beforeText = transcriptionCapture.before ? (transcriptionCapture.before.displayText || transcriptionCapture.before.text) : '';
+    const afterText = transcriptionCapture.after ? (transcriptionCapture.after.displayText || transcriptionCapture.after.text) : '';
+    const transcriptSections = [
+        { side: 'before', text: beforeText },
+        { side: 'after', text: afterText }
+    ];
+    const dot = '<span style="color:#9ca3af;margin:0 5px;">&middot;</span>';
     let html =
         '<span style="color:#e5e7eb;margin-right:4px;">Words</span>' +
         `<span style="color:#3b82f6;font-weight:600;">${totalWords.toLocaleString()}</span>` +
@@ -1690,12 +1883,16 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
         '<div data-lbh-nodrag style="margin-top:10px;padding-top:8px;border-top:1px solid #334155;">' +
             '<div style="color:#cbd5e1;font-weight:700;letter-spacing:0.02em;">Transcription</div>' +
         '</div>' +
-        renderTranscriptSection('Before', transcriptionCapture.before ? (transcriptionCapture.before.displayText || transcriptionCapture.before.text) : '', '#f59e0b') +
-        renderTranscriptSection('After', transcriptionCapture.after ? (transcriptionCapture.after.displayText || transcriptionCapture.after.text) : '', '#22c55e');
+        renderTranscriptSection('Before', beforeText, '#f59e0b') +
+        renderTranscriptSection('After', afterText, '#22c55e');
 
-    if (html !== lastRenderedWidgetHtml) {
+    const didRender = html !== lastRenderedWidgetHtml;
+    if (didRender) {
         widget.innerHTML = html;
         lastRenderedWidgetHtml = html;
+    }
+    populateTranscriptSections(widget, transcriptSections);
+    if (didRender) {
         protectTranscriptTextareaEvents(widget);
     }
     widget.style.display = '';
@@ -1707,6 +1904,7 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
     applyWidgetSizeMode(widget);
     const dot = '<span style="color:#9ca3af;margin:0 5px;">&middot;</span>';
     const summaryAlign = 'center';
+    const transcriptSections = [];
     let summaryHtml = '';
 
     if (totalMs > 0) {
@@ -1762,18 +1960,26 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
     if (transcriptPanelExpanded) {
         const beforeText = transcriptionCapture.before ? (transcriptionCapture.before.displayText || transcriptionCapture.before.text) : '';
         const afterText = transcriptionCapture.after ? (transcriptionCapture.after.displayText || transcriptionCapture.after.text) : '';
-        const diffHtml = buildTranscriptDiffHighlights(beforeText, afterText);
+        const diff = buildTranscriptDiffHighlights(beforeText, afterText);
+        transcriptSections.push(
+            { side: 'before', text: beforeText, highlight: diff.before },
+            { side: 'after', text: afterText, highlight: diff.after }
+        );
         html +=
             '<div data-lbh-nodrag style="margin-top:10px;padding-top:8px;border-top:1px solid #334155;">' +
                 '<div style="color:#cbd5e1;font-weight:700;letter-spacing:0.02em;text-align:center;">Transcription</div>' +
             '</div>' +
-            renderTranscriptSection('Before', beforeText, '#f59e0b', diffHtml.beforeHtml) +
-            renderTranscriptSection('After', afterText, '#22c55e', diffHtml.afterHtml);
+            renderTranscriptSection('Before', beforeText, '#f59e0b') +
+            renderTranscriptSection('After', afterText, '#22c55e');
     }
 
-    if (html !== lastRenderedWidgetHtml) {
+    const didRender = html !== lastRenderedWidgetHtml;
+    if (didRender) {
         widget.innerHTML = html;
         lastRenderedWidgetHtml = html;
+    }
+    populateTranscriptSections(widget, transcriptSections);
+    if (didRender) {
         protectTranscriptTextareaEvents(widget);
     }
     widget.style.display = '';
@@ -1912,7 +2118,9 @@ function escapeHtml(value) {
     return value
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 function buildWordRegex(words, flags) {
@@ -2507,7 +2715,7 @@ function runHighlightPass(fullReset = false) {
         try {
             if (field.getAttribute('aria-hidden') === 'true') return;
 
-            const text = field.value || field.textContent || '';
+            const text = getReadableTranscriptElementText(field, 'current');
             const isTextarea = field.matches('textarea');
 
             if (isTextarea) {
@@ -2519,7 +2727,7 @@ function runHighlightPass(fullReset = false) {
             processVisItem(field, text, matchers);
             applyDirectHighlightFallback(field, text, matchers);
         } catch (error) {
-            const fallbackText = field && (field.value || field.textContent || '');
+            const fallbackText = field && getReadableTranscriptElementText(field, 'current');
             if (fallbackText) applyDirectHighlightFallback(field, fallbackText, matchers);
             if (DEBUG_LOGS) console.warn('[LBH] highlight scan skipped one field:', error);
         }
@@ -2583,7 +2791,17 @@ function invalidateRoleCacheIfNeeded(target) {
 
 function handlePageInputOrChange(e) {
     const roleChanged = invalidateRoleCacheIfNeeded(e.target);
+    if (isTranscriptTextarea(e.target)) {
+        rememberTranscriptTextareaValue(e.target, { current: true });
+    }
     if (settings.enabled && (roleChanged || isTranscriptTextarea(e.target))) updateWordCount();
+    scheduleCheck();
+}
+
+function handleTranscriptTextareaBeforeEdit(e) {
+    if (!isTranscriptTextarea(e.target)) return;
+    rememberTranscriptTextareaValue(e.target, { initial: true, current: true });
+    if (settings.enabled) updateWordCount();
     scheduleCheck();
 }
 
@@ -2849,6 +3067,8 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 loadSettingsAndApply();
 startDomObserver();
 startHighlightWatchdog();
+document.addEventListener('focusin', handleTranscriptTextareaBeforeEdit, true);
+document.addEventListener('beforeinput', handleTranscriptTextareaBeforeEdit, true);
 document.addEventListener('input', handlePageInputOrChange);
 document.addEventListener('change', handlePageInputOrChange);
 
