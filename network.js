@@ -3,6 +3,11 @@
 
     const STORAGE_KEY = '_lbhTtMs';
     const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+    const forwardedShiftSpaceEvents = new WeakSet();
+
+    function isSpaceKey(e) {
+        return e.code === 'Space' || e.key === ' ' || e.key === 'Spacebar';
+    }
 
     function isTextEditingElement(el) {
         if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
@@ -22,7 +27,7 @@
 
     function getEditableShiftSpaceTarget(e) {
         if (!e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return null;
-        if (e.code !== 'Space' && e.key !== ' ' && e.key !== 'Spacebar') return null;
+        if (!isSpaceKey(e)) return null;
 
         const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
         for (const node of path) {
@@ -39,13 +44,44 @@
     }
 
     function blockEditableShiftSpaceShortcut(e) {
+        if (forwardedShiftSpaceEvents.has(e)) return;
         if (!getEditableShiftSpaceTarget(e)) return;
 
         // Keep native space insertion, but stop Labelbox's media shortcut from seeing it.
         e.stopImmediatePropagation();
     }
 
+    function remapCtrlSpaceToShiftSpace(e) {
+        if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey || !isSpaceKey(e)) return;
+
+        e.preventDefault();
+        e.stopImmediatePropagation();
+
+        const forwardedEvent = new KeyboardEvent(e.type, {
+            key: ' ',
+            code: 'Space',
+            location: e.location,
+            repeat: e.repeat,
+            shiftKey: true,
+            ctrlKey: false,
+            altKey: false,
+            metaKey: false,
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            keyCode: 32,
+            which: 32,
+            charCode: e.type === 'keypress' ? 32 : 0
+        });
+        forwardedShiftSpaceEvents.add(forwardedEvent);
+
+        const target = e.target && typeof e.target.dispatchEvent === 'function' ? e.target : document;
+        target.dispatchEvent(forwardedEvent);
+    }
+
     ['keydown', 'keypress', 'keyup'].forEach(type => {
+        window.addEventListener(type, remapCtrlSpaceToShiftSpace, true);
+        document.addEventListener(type, remapCtrlSpaceToShiftSpace, true);
         window.addEventListener(type, blockEditableShiftSpaceShortcut, true);
         document.addEventListener(type, blockEditableShiftSpaceShortcut, true);
     });

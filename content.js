@@ -4,6 +4,7 @@ const DEFAULT_SETTINGS = {
     enableCaseSensitiveWords: true,
     enablePunctuation: true,
     enableOrangeAngle: true,
+    showRatingHelper: true,
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -2379,6 +2380,11 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
 function updateWordCount() {
     if (isTopFrame()) {
         updateTranscriptionCapture();
+        if (!settings.showRatingHelper || widgetDismissed) {
+            hideWordCountWidget();
+            return;
+        }
+
         const local = getLocalCounts();
         // Suppress TT when timeline is confirmed narrow (sidebar covering it).
         // containerWidth 0 means not yet reported — don't suppress in that case.
@@ -2474,7 +2480,7 @@ if (isTopFrame()) {
             return;
         }
 
-        if (wordCountWidget && wordCountWidget.style.display !== 'none') {
+        if (settings.showRatingHelper && wordCountWidget && wordCountWidget.style.display !== 'none') {
             const local = getLocalCounts();
             const timelineWide = childFrameCount.containerWidth === 0 || childFrameCount.containerWidth >= 500;
             const ttMs = timelineWide
@@ -2516,6 +2522,7 @@ function normalizeSettings(raw) {
         enableCaseSensitiveWords: raw.enableCaseSensitiveWords !== false,
         enablePunctuation: raw.enablePunctuation !== false,
         enableOrangeAngle: raw.enableOrangeAngle !== false,
+        showRatingHelper: raw.showRatingHelper !== false,
         wordsToHighlight: wordsToHighlight.length ? wordsToHighlight : [...DEFAULT_SETTINGS.wordsToHighlight],
         wordsToHighlightCaseSensitive: wordsToHighlightCaseSensitive.length ? wordsToHighlightCaseSensitive : [...DEFAULT_SETTINGS.wordsToHighlightCaseSensitive],
         remoteRemoved: sanitizeStringArray(raw.remoteRemoved, []),
@@ -3497,7 +3504,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     // Network-intercepted TT updated by network.js
     if (changes._lbhTtMs) {
         networkTtMs = changes._lbhTtMs.newValue;
-        if (isTopFrame() && settings.enabled && wordCountWidget && wordCountWidget.style.display !== 'none') {
+        if (isTopFrame() && settings.enabled && settings.showRatingHelper && wordCountWidget && wordCountWidget.style.display !== 'none') {
             const local = getLocalCounts();
             const ttMs = networkTtMs >= 0    ? networkTtMs :
                          childFrameTtMs >= 0  ? childFrameTtMs :

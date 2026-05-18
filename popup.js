@@ -5,6 +5,7 @@ const DEFAULT_SETTINGS = {
     enableOrangeAngle: true,
     enableGKLookup: true,
     enableTabDedup: true,
+    showRatingHelper: true,
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -16,6 +17,7 @@ const elements = {
     enableOrangeAngle: document.getElementById('enableOrangeAngle'),
     enableGKLookup: document.getElementById('enableGKLookup'),
     enableTabDedup: document.getElementById('enableTabDedup'),
+    showRatingHelper: document.getElementById('showRatingHelper'),
     wordsToHighlight: document.getElementById('wordsToHighlight'),
     wordsToHighlightCaseSensitive: document.getElementById('wordsToHighlightCaseSensitive'),
     save: document.getElementById('save'),
@@ -102,6 +104,7 @@ function render(settings) {
     elements.enableOrangeAngle.checked = settings.enableOrangeAngle;
     elements.enableGKLookup.checked = settings.enableGKLookup;
     elements.enableTabDedup.checked = settings.enableTabDedup;
+    elements.showRatingHelper.checked = settings.showRatingHelper;
     elements.wordsToHighlight.value = toCsv(settings.wordsToHighlight);
     elements.wordsToHighlightCaseSensitive.value = toCsv(settings.wordsToHighlightCaseSensitive);
 
@@ -116,6 +119,7 @@ function collectSettingsFromForm() {
         enableOrangeAngle: elements.enableOrangeAngle.checked,
         enableGKLookup: elements.enableGKLookup.checked,
         enableTabDedup: elements.enableTabDedup.checked,
+        showRatingHelper: elements.showRatingHelper.checked,
         wordsToHighlight: parseCsv(elements.wordsToHighlight.value),
         wordsToHighlightCaseSensitive: parseCsv(elements.wordsToHighlightCaseSensitive.value)
     };
@@ -129,6 +133,17 @@ function save() {
     });
 }
 
+function saveRatingHelperVisibility() {
+    const showRatingHelper = elements.showRatingHelper.checked;
+    const update = showRatingHelper
+        ? { showRatingHelper, _lbhWidgetHidden: false }
+        : { showRatingHelper };
+
+    chrome.storage.local.set(update, () => {
+        showStatus('Saved');
+    });
+}
+
 chrome.storage.local.get(DEFAULT_SETTINGS, stored => {
     const initialSettings = { ...DEFAULT_SETTINGS, ...stored };
     render(initialSettings);
@@ -138,6 +153,7 @@ chrome.storage.local.get(DEFAULT_SETTINGS, stored => {
 chrome.storage.local.set({ _lbhWidgetHidden: false });
 
 elements.save.addEventListener('click', save);
+elements.showRatingHelper.addEventListener('change', saveRatingHelperVisibility);
 
 // ── GK Lookup ─────────────────────────────────────────────────────────────────
 
