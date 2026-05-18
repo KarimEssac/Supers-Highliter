@@ -30,6 +30,8 @@ const ROLE_ASSIGNMENTS_CACHE_MS = 350;
 const WIDGET_COLLAPSED_WIDTH_PX = 320;
 const WIDGET_EXPANDED_DEFAULT_WIDTH_PX = 520;
 const WIDGET_EXPANDED_DEFAULT_HEIGHT_PX = 430;
+const STALE_ROW_SNAPSHOT_REJECT_MS = 7000;
+const SAVE_ROLLBACK_GUARD_MS = 10000;
 
 let settings = { ...DEFAULT_SETTINGS, remoteRemoved: [], remoteCommunityAudit: [], remoteSrFlag: [] };
 let isCheckScheduled = false;
@@ -41,6 +43,7 @@ let highlightWatchdog = null;
 let widgetDismissed = false;
 // TT sourced from network interception (-1 = not yet received)
 let networkTtMs = -1;
+let networkTtRowKey = '';
 // Timeline selection state (top frame only)
 let selectionDurationMs = -1;
 let selectionTotalMediaMs = -1;
@@ -57,6 +60,13 @@ let widgetExpandedSize = {
     width: WIDGET_EXPANDED_DEFAULT_WIDTH_PX,
     height: WIDGET_EXPANDED_DEFAULT_HEIGHT_PX
 };
+let widgetCollapsedReturnPosition = null;
+let widgetAutoRepositionedForExpansion = false;
+let rowTransitionStartedAt = 0;
+let staleRowSnapshotSignatures = new Set();
+let saveRollbackGuard = { rowKey: '', until: 0, snapshot: null, beforeSignature: '' };
+let lastMeaningfulLiveSnapshot = null;
+let lastMeaningfulLiveSnapshotAt = 0;
 
 // ── Word Count Widget ─────────────────────────────────────────────────────────
 
@@ -79,11 +89,30 @@ function suppressNextWidgetToggle(widget, delayMs = 450) {
 }
 
 function toggleTranscriptPanel() {
-    if (transcriptPanelExpanded && wordCountWidget) {
+    const expanding = !transcriptPanelExpanded;
+    if (expanding && wordCountWidget) {
+        const rect = wordCountWidget.getBoundingClientRect();
+        widgetCollapsedReturnPosition = { left: rect.left, top: rect.top };
+        widgetAutoRepositionedForExpansion = false;
+    } else if (transcriptPanelExpanded && wordCountWidget) {
         persistWidgetExpandedSize(wordCountWidget);
     }
-    transcriptPanelExpanded = !transcriptPanelExpanded;
+    transcriptPanelExpanded = expanding;
     if (settings.enabled) updateWordCount();
+}
+
+function clearWidgetExpansionReturnPosition() {
+    widgetCollapsedReturnPosition = null;
+    widgetAutoRepositionedForExpansion = false;
+}
+
+function restoreWidgetPositionAfterCollapse(widget) {
+    if (!widget || transcriptPanelExpanded) return;
+    if (widgetAutoRepositionedForExpansion && widgetCollapsedReturnPosition) {
+        const restored = applyWidgetPosition(widget, widgetCollapsedReturnPosition.left, widgetCollapsedReturnPosition.top);
+        chrome.storage.local.set({ _lbhWidgetX: restored.left, _lbhWidgetY: restored.top });
+    }
+    clearWidgetExpansionReturnPosition();
 }
 
 function countWordsInText(text) {
@@ -195,6 +224,23 @@ function getCurrentDataRowKey() {
     const match = window.location.pathname.match(/\/projects\/([^/]+)\/data-rows\/([^/?#]+)/);
     if (!match) return window.location.pathname;
     return `${match[1]}/${match[2]}`;
+}
+
+function getDataRowIdFromKey(rowKey) {
+    const value = String(rowKey || '');
+    const pathMatch = value.match(/\/data-rows\/([^/?#]+)/);
+    if (pathMatch) return pathMatch[1];
+    const compactMatch = value.match(/^[^/?#]+\/([^/?#]+)$/);
+    return compactMatch ? compactMatch[1] : '';
+}
+
+function isRowKeyCompatible(rowKey, currentRowKey = getCurrentDataRowKey()) {
+    if (!rowKey || !currentRowKey) return false;
+    if (rowKey === currentRowKey) return true;
+
+    const incomingDataRowId = getDataRowIdFromKey(rowKey);
+    const currentDataRowId = getDataRowIdFromKey(currentRowKey);
+    return !!incomingDataRowId && incomingDataRowId === currentDataRowId;
 }
 
 function getTimelineItemForElement(el) {
@@ -726,24 +772,83 @@ function formatTranscriptSegmentForDisplay(segment) {
     return segment.role ? `${segment.role}: ${segment.text}` : segment.text;
 }
 
+function getTranscriptTokenMatches(text) {
+    return [...String(text || '').matchAll(/[A-Za-z0-9]+(?:['\u2019-][A-Za-z0-9]+)*/g)];
+}
+
+function stripRepeatedGhostText(text) {
+    let value = normalizeSegmentText(text);
+
+    for (let pass = 0; pass < 3; pass += 1) {
+        const matches = getTranscriptTokenMatches(value);
+        if (matches.length < 2 || matches.length % 2 !== 0) break;
+
+        const half = matches.length / 2;
+        const firstTokens = matches.slice(0, half).map(match => match[0].toLowerCase());
+        const secondTokens = matches.slice(half).map(match => match[0].toLowerCase());
+        const isDuplicate = firstTokens.every((token, index) => token === secondTokens[index]);
+        if (!isDuplicate) break;
+
+        const firstHalfText = value.slice(0, matches[half].index).trim();
+        const firstHalfTokenText = firstTokens.join(' ');
+        if (firstHalfText.length < 8 && firstTokens.length < 2) break;
+
+        value = firstHalfText || firstHalfTokenText;
+    }
+
+    return value;
+}
+
+function getGhostSegmentFingerprint(segment) {
+    return getTranscriptTokenMatches(segment.text)
+        .map(match => match[0].toLowerCase())
+        .join(' ');
+}
+
+function isDuplicateGhostSegment(previous, current) {
+    if (!previous || !current) return false;
+    const previousFingerprint = getGhostSegmentFingerprint(previous);
+    if (!previousFingerprint || previousFingerprint !== getGhostSegmentFingerprint(current)) return false;
+
+    if (Number.isFinite(previous.speakerNumber) && Number.isFinite(current.speakerNumber) && previous.speakerNumber !== current.speakerNumber) {
+        return false;
+    }
+
+    const previousRole = normalizeSpeakerRole(previous.role);
+    const currentRole = normalizeSpeakerRole(current.role);
+    return !previousRole || !currentRole || previousRole === currentRole;
+}
+
+function removeDuplicateGhostSegments(segments) {
+    const deduped = [];
+
+    segments.forEach(segment => {
+        const previous = deduped[deduped.length - 1];
+        if (isDuplicateGhostSegment(previous, segment)) return;
+        deduped.push(segment);
+    });
+
+    return deduped;
+}
+
 function buildSnapshotFromSegments(segments) {
-    const cleanSegments = segments
+    const cleanSegments = removeDuplicateGhostSegments(segments
         .map(segment => {
             if (segment && typeof segment === 'object') {
                 return {
-                    text: normalizeSegmentText(segment.text),
+                    text: stripRepeatedGhostText(segment.text),
                     role: normalizeSpeakerRole(segment.role),
                     speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null
                 };
             }
 
             return {
-                text: normalizeSegmentText(segment),
+                text: stripRepeatedGhostText(segment),
                 role: '',
                 speakerNumber: null
             };
         })
-        .filter(segment => segment.text.length > 0);
+        .filter(segment => segment.text.length > 0));
 
     if (cleanSegments.length === 0) return null;
 
@@ -946,6 +1051,113 @@ function shouldUpgradeSnapshotWithLiteralAngles(existingSnapshot, candidateSnaps
         || existingLossy.includes(candidateLossy);
 }
 
+function getSnapshotSignature(snapshot) {
+    return snapshot ? (snapshot.signature || getSnapshotSegmentText(snapshot)) : '';
+}
+
+function collectSnapshotSignatures(...snapshots) {
+    return snapshots
+        .map(getSnapshotSignature)
+        .filter(Boolean);
+}
+
+function snapshotsHaveSameSignature(a, b) {
+    const aSignature = getSnapshotSignature(a);
+    const bSignature = getSnapshotSignature(b);
+    return !!aSignature && !!bSignature && aSignature === bSignature;
+}
+
+function snapshotDiffersFromBefore(snapshot, beforeSnapshot) {
+    if (!snapshot) return false;
+    if (!beforeSnapshot) return true;
+    return !snapshotsHaveSameSignature(snapshot, beforeSnapshot);
+}
+
+function clearSaveRollbackGuard(options = {}) {
+    saveRollbackGuard = { rowKey: '', until: 0, snapshot: null, beforeSignature: '' };
+    if (options.clearLastMeaningful) {
+        lastMeaningfulLiveSnapshot = null;
+        lastMeaningfulLiveSnapshotAt = 0;
+    }
+}
+
+function rememberMeaningfulLiveSnapshot(snapshot, beforeSnapshot) {
+    if (!snapshotDiffersFromBefore(snapshot, beforeSnapshot)) return;
+    lastMeaningfulLiveSnapshot = cloneTranscriptSnapshot(snapshot);
+    lastMeaningfulLiveSnapshotAt = Date.now();
+}
+
+function setSaveRollbackGuard(rowKey, snapshot, beforeSnapshot = null) {
+    if (!snapshot) return false;
+    saveRollbackGuard = {
+        rowKey: rowKey || getCurrentDataRowKey(),
+        // Keep this for the row. Reset and row changes clear it explicitly.
+        until: Number.POSITIVE_INFINITY,
+        snapshot: cloneTranscriptSnapshot(snapshot),
+        beforeSignature: getSnapshotSignature(beforeSnapshot)
+    };
+    return true;
+}
+
+function getSaveRollbackCandidate(beforeSnapshot) {
+    const liveSnapshot = getPreferredLiveTranscriptSnapshot();
+    if (snapshotDiffersFromBefore(liveSnapshot, beforeSnapshot)) return liveSnapshot;
+
+    if (liveSnapshot) return null;
+    if (snapshotDiffersFromBefore(transcriptionCapture.after, beforeSnapshot)) return transcriptionCapture.after;
+    if (
+        snapshotDiffersFromBefore(lastMeaningfulLiveSnapshot, beforeSnapshot)
+        && Date.now() - lastMeaningfulLiveSnapshotAt < SAVE_ROLLBACK_GUARD_MS
+    ) {
+        return lastMeaningfulLiveSnapshot;
+    }
+
+    return null;
+}
+
+function armSaveRollbackGuard(snapshot = null, rowKey = getCurrentDataRowKey()) {
+    const beforeSnapshot = transcriptionCapture.before || getPreferredSavedTranscriptSnapshot();
+    const candidate = snapshotDiffersFromBefore(snapshot, beforeSnapshot)
+        ? snapshot
+        : getSaveRollbackCandidate(beforeSnapshot);
+
+    if (!snapshotDiffersFromBefore(candidate, beforeSnapshot)) return false;
+    return setSaveRollbackGuard(rowKey, candidate, beforeSnapshot);
+}
+
+function isSaveRollbackGuardActive(rowKey = getCurrentDataRowKey()) {
+    if (!saveRollbackGuard.snapshot) return false;
+    if (Date.now() > saveRollbackGuard.until) {
+        clearSaveRollbackGuard();
+        return false;
+    }
+    if (!isRowKeyCompatible(saveRollbackGuard.rowKey, rowKey)) return false;
+    return true;
+}
+
+function applySaveRollbackGuard(beforeSnapshot, afterSnapshot, rowKey = getCurrentDataRowKey()) {
+    if (!isSaveRollbackGuardActive(rowKey)) return afterSnapshot;
+    if (!beforeSnapshot || !saveRollbackGuard.snapshot) return afterSnapshot;
+    if (saveRollbackGuard.beforeSignature && saveRollbackGuard.beforeSignature !== getSnapshotSignature(beforeSnapshot)) {
+        clearSaveRollbackGuard();
+        return afterSnapshot;
+    }
+    if (snapshotDiffersFromBefore(afterSnapshot, beforeSnapshot)) return afterSnapshot;
+    if (!snapshotDiffersFromBefore(saveRollbackGuard.snapshot, beforeSnapshot)) return afterSnapshot;
+    return cloneTranscriptSnapshot(saveRollbackGuard.snapshot);
+}
+
+function rejectStaleRowSnapshot(snapshot) {
+    if (!snapshot || staleRowSnapshotSignatures.size === 0) return snapshot;
+    if (Date.now() - rowTransitionStartedAt > STALE_ROW_SNAPSHOT_REJECT_MS) return snapshot;
+    return staleRowSnapshotSignatures.has(getSnapshotSignature(snapshot)) ? null : snapshot;
+}
+
+function markRowDataAccepted(beforeSnapshot, afterSnapshot) {
+    if (!beforeSnapshot && !afterSnapshot) return;
+    staleRowSnapshotSignatures.clear();
+}
+
 function fillMissingRoleAssignmentsInSnapshot(snapshot) {
     if (!snapshotNeedsMissingRoleBackfill(snapshot)) return snapshot;
 
@@ -963,6 +1175,36 @@ function fillMissingRoleAssignmentsInSnapshot(snapshot) {
     });
 
     return buildSnapshotFromSegments(segments) || snapshot;
+}
+
+function createEmptyChildFrameCount() {
+    return { words: 0, segments: 0, totalMs: 0, containerWidth: 0, deduplicatedTtMs: 0 };
+}
+
+function resetRowScopedState(rowKey, previousCapture = transcriptionCapture) {
+    staleRowSnapshotSignatures = new Set(collectSnapshotSignatures(previousCapture.before, previousCapture.after));
+    rowTransitionStartedAt = Date.now();
+
+    transcriptionCapture = { rowKey, before: null, after: null, metrics: null };
+    childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
+    childFrameCount = createEmptyChildFrameCount();
+    childFrameTtMs = -1;
+    networkTtMs = -1;
+    networkTtRowKey = '';
+    cachedTotalMediaMs = 0;
+    selectionDurationMs = -1;
+    selectionTotalMediaMs = -1;
+    transcriptPanelExpanded = false;
+    lastSavedTranscriptionSignature = '';
+    clearSaveRollbackGuard({ clearLastMeaningful: true });
+    clearWidgetExpansionReturnPosition();
+    resetTranscriptRawTextCacheIfNeeded(rowKey);
+
+    window.setTimeout(() => {
+        if (getCurrentDataRowKey() === rowKey && settings.enabled) {
+            scheduleCheck(true);
+        }
+    }, 100);
 }
 
 function choosePreferredSnapshot(localSnapshot, childSnapshot) {
@@ -1045,21 +1287,21 @@ function persistTranscriptionCapture() {
 function updateTranscriptionCapture() {
     const rowKey = getCurrentDataRowKey();
     if (transcriptionCapture.rowKey !== rowKey) {
-        transcriptionCapture = { rowKey, before: null, after: null, metrics: null };
-        childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
-        lastSavedTranscriptionSignature = '';
-        selectionDurationMs = -1;
-        selectionTotalMediaMs = -1;
-        resetTranscriptRawTextCacheIfNeeded(rowKey);
+        resetRowScopedState(rowKey);
+        persistTranscriptionCapture();
+        return;
     }
 
-    const beforeSnapshot = getPreferredSavedTranscriptSnapshot();
-    const afterSnapshot = getPreferredLiveTranscriptSnapshot() || beforeSnapshot;
+    const beforeSnapshot = rejectStaleRowSnapshot(getPreferredSavedTranscriptSnapshot());
+    let afterSnapshot = rejectStaleRowSnapshot(getPreferredLiveTranscriptSnapshot()) || beforeSnapshot;
+    afterSnapshot = applySaveRollbackGuard(beforeSnapshot, afterSnapshot, rowKey);
 
     if (!beforeSnapshot && !afterSnapshot) {
         persistTranscriptionCapture();
         return;
     }
+
+    markRowDataAccepted(beforeSnapshot, afterSnapshot);
 
     if (!transcriptionCapture.before && beforeSnapshot) {
         transcriptionCapture.before = cloneTranscriptSnapshot(beforeSnapshot);
@@ -1072,6 +1314,7 @@ function updateTranscriptionCapture() {
     }
 
     transcriptionCapture.after = afterSnapshot ? cloneTranscriptSnapshot(afterSnapshot) : null;
+    rememberMeaningfulLiveSnapshot(transcriptionCapture.after, transcriptionCapture.before);
     transcriptionCapture.metrics = transcriptionCapture.before && transcriptionCapture.after
         ? computeTranscriptionMetrics(transcriptionCapture.before, transcriptionCapture.after)
         : null;
@@ -1260,6 +1503,11 @@ function applyWidgetPosition(widget, x, y) {
     widget.style.left = `${cx}px`;
     widget.style.top = `${cy}px`;
     widget.style.bottom = 'auto';
+    return {
+        left: cx,
+        top: cy,
+        moved: Math.abs(cx - x) > 0.5 || Math.abs(cy - y) > 0.5
+    };
 }
 
 function clampWidgetExpandedSize(width, height) {
@@ -1304,7 +1552,10 @@ function applyWidgetSizeMode(widget) {
 
     if (document.body.contains(widget)) {
         const rect = widget.getBoundingClientRect();
-        applyWidgetPosition(widget, rect.left, rect.top);
+        const applied = applyWidgetPosition(widget, rect.left, rect.top);
+        if (applied.moved && widgetCollapsedReturnPosition) {
+            widgetAutoRepositionedForExpansion = true;
+        }
     }
 }
 
@@ -1323,6 +1574,7 @@ function makeDraggable(widget) {
         if (closestFromEventTarget(e.target, '[data-lbh-close]')) return;
         if (isWidgetResizeHandlePress(widget, e)) {
             resizing = true;
+            clearWidgetExpansionReturnPosition();
             widget.dataset.lbhResizing = 'true';
             suppressNextWidgetToggle(widget, 700);
             return;
@@ -1345,6 +1597,7 @@ function makeDraggable(widget) {
         if (!dragging) return;
         if (Math.abs(e.clientX - originX) > 3 || Math.abs(e.clientY - originY) > 3) {
             didMove = true;
+            if (transcriptPanelExpanded) clearWidgetExpansionReturnPosition();
         }
         const x = startLeft + (e.clientX - originX);
         const y = startTop + (e.clientY - originY);
@@ -1787,6 +2040,8 @@ function renderWidgetButton(label, action, isActive = false) {
 
 let lastWidgetActionName = '';
 let lastWidgetActionAt = 0;
+let lastLabelboxWorkflowActionName = '';
+let lastLabelboxWorkflowActionAt = 0;
 
 function runWidgetAction(action) {
     const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
@@ -1834,20 +2089,84 @@ function suppressWidgetActionClick(e) {
     return true;
 }
 
-function renderSelectionSummaryHtml(dot, fallbackTotalMs = 0) {
-    if (selectionDurationMs < 0) return '';
+function getLabelboxWorkflowAction(target) {
+    if (closestFromEventTarget(target, '[data-cy="submit-label-btn"]')) return 'save';
+    if (closestFromEventTarget(target, '[data-cy="skip-label-btn"]')) return 'reset';
+    return '';
+}
 
+function queuePostLabelboxWorkflowCapture() {
+    if (!settings.enabled) return;
+    scheduleCheck();
+    window.setTimeout(() => {
+        if (settings.enabled) scheduleCheck(true);
+    }, 150);
+    window.setTimeout(() => {
+        if (settings.enabled) scheduleCheck(true);
+    }, 700);
+}
+
+function postLabelboxWorkflowActionToParent(action) {
+    if (isTopFrame()) return;
+
+    try {
+        window.parent.postMessage({
+            type: 'LBH_LABELBOX_WORKFLOW_ACTION',
+            action,
+            rowKey: getCurrentDataRowKey(),
+            snapshot: action === 'save' && saveRollbackGuard.snapshot
+                ? cloneTranscriptSnapshot(saveRollbackGuard.snapshot)
+                : null
+        }, '*');
+    } catch (e) { /* cross-origin guard */ }
+}
+
+function runLabelboxWorkflowAction(action) {
+    const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    if (action === lastLabelboxWorkflowActionName && now - lastLabelboxWorkflowActionAt < 250) return;
+    lastLabelboxWorkflowActionName = action;
+    lastLabelboxWorkflowActionAt = now;
+
+    if (action === 'reset') {
+        clearSaveRollbackGuard({ clearLastMeaningful: true });
+        postLabelboxWorkflowActionToParent(action);
+        queuePostLabelboxWorkflowCapture();
+        return;
+    }
+
+    if (action === 'save') {
+        armSaveRollbackGuard();
+        postLabelboxWorkflowActionToParent(action);
+        queuePostLabelboxWorkflowCapture();
+    }
+}
+
+function handleLabelboxWorkflowActionPress(e) {
+    if (typeof e.button === 'number' && e.button !== 0) return false;
+
+    const action = getLabelboxWorkflowAction(e.target);
+    if (!action) return false;
+
+    runLabelboxWorkflowAction(action);
+    return true;
+}
+
+function handleLabelboxWorkflowActionKeydown(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return false;
+    return handleLabelboxWorkflowActionPress(e);
+}
+
+function renderSelectionSummaryHtml(dot, fallbackTotalMs = 0) {
+    const durationMs = Math.max(0, selectionDurationMs);
     const denominatorMs = fallbackTotalMs > 0 ? fallbackTotalMs : selectionTotalMediaMs;
     const pct = denominatorMs > 0
-        ? Math.min(100, Math.max(0, selectionDurationMs / denominatorMs * 100))
+        ? Math.min(100, Math.max(0, durationMs / denominatorMs * 100))
         : 0;
-    const pctHtml = denominatorMs > 0
-        ? dot + `<span style="color:#a78bfa;">${pct.toFixed(1)}%</span>`
-        : '';
 
     return '<span style="color:#e5e7eb;margin-right:4px;">Sel</span>' +
-        `<span style="color:#a78bfa;font-weight:600;">${formatDuration(selectionDurationMs)}</span>` +
-        pctHtml;
+        `<span style="color:#a78bfa;font-weight:600;">${formatDuration(durationMs)}</span>` +
+        dot +
+        `<span style="color:#a78bfa;">${pct.toFixed(1)}%</span>`;
 }
 
 function getAccuracyColor(accuracyPct) {
@@ -1943,16 +2262,8 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionHtml) {
-            html += dot + selectionHtml;
-        } else {
-            const fivePercMs = totalMs * 0.05;
-            html +=
-                dot +
-                '<span style="color:#e5e7eb;margin-right:4px;">5%</span>' +
-                `<span style="color:#f59e0b;font-weight:600;">${formatDuration(fivePercMs)}</span>`;
-        }
-    } else if (selectionHtml) {
+        html += dot + selectionHtml;
+    } else {
         html += '<br>' + selectionHtml;
     }
 
@@ -1985,6 +2296,7 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
         protectTranscriptTextareaEvents(widget);
     }
     widget.style.display = '';
+    restoreWidgetPositionAfterCollapse(widget);
 }
 
 function renderWordCountWidget(totalWords, totalSegments, totalMs) {
@@ -2002,16 +2314,8 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionHtml) {
-            summaryHtml += dot + selectionHtml;
-        } else {
-            const fivePercMs = totalMs * 0.05;
-            summaryHtml +=
-                dot +
-                '<span style="color:#e5e7eb;margin-right:4px;">5%</span>' +
-                `<span style="color:#f59e0b;font-weight:600;">${formatDuration(fivePercMs)}</span>`;
-        }
-    } else if (selectionHtml) {
+        summaryHtml += dot + selectionHtml;
+    } else {
         summaryHtml += selectionHtml;
     }
 
@@ -2069,6 +2373,7 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
         protectTranscriptTextareaEvents(widget);
     }
     widget.style.display = '';
+    restoreWidgetPositionAfterCollapse(widget);
 }
 
 function updateWordCount() {
@@ -2098,6 +2403,8 @@ function updateWordCount() {
             console.log('[LBH] waveform container width px:', containerWidth);
         }
         const deduplicatedTtMs = getDeduplicatedTtMs();
+        const savedSnapshot = buildSavedTranscriptSnapshot();
+        const liveSnapshot = applySaveRollbackGuard(savedSnapshot, buildLiveTranscriptSnapshot(), getCurrentDataRowKey());
         try {
             window.parent.postMessage(
                 { type: 'LBH_WORD_COUNT', words: local.words, segments: local.segments, totalMs: local.totalMs, containerWidth, deduplicatedTtMs },
@@ -2107,8 +2414,8 @@ function updateWordCount() {
                 {
                     type: 'LBH_TRANSCRIPTION_STATE',
                     rowKey: getCurrentDataRowKey(),
-                    savedSnapshot: buildSavedTranscriptSnapshot(),
-                    liveSnapshot: buildLiveTranscriptSnapshot()
+                    savedSnapshot,
+                    liveSnapshot
                 },
                 '*'
             );
@@ -2133,6 +2440,17 @@ if (isTopFrame()) {
                 savedSnapshot: e.data.savedSnapshot ? cloneTranscriptSnapshot(e.data.savedSnapshot) : null,
                 liveSnapshot: e.data.liveSnapshot ? cloneTranscriptSnapshot(e.data.liveSnapshot) : null
             };
+            updateTranscriptionCapture();
+            if (settings.enabled) scheduleCheck();
+            return;
+        } else if (e.data.type === 'LBH_LABELBOX_WORKFLOW_ACTION') {
+            if (e.data.action === 'reset') {
+                clearSaveRollbackGuard({ clearLastMeaningful: true });
+            } else if (e.data.action === 'save' && e.data.snapshot) {
+                const incomingRowKey = e.data.rowKey || '';
+                const guardRowKey = isRowKeyCompatible(incomingRowKey) ? incomingRowKey : getCurrentDataRowKey();
+                armSaveRollbackGuard(cloneTranscriptSnapshot(e.data.snapshot), guardRowKey);
+            }
             updateTranscriptionCapture();
             if (settings.enabled) scheduleCheck();
             return;
@@ -3234,6 +3552,10 @@ document.addEventListener('focusin', handleTranscriptTextareaBeforeEdit, true);
 document.addEventListener('beforeinput', handleTranscriptTextareaBeforeEdit, true);
 document.addEventListener('input', handlePageInputOrChange);
 document.addEventListener('change', handlePageInputOrChange);
+document.addEventListener('pointerdown', handleLabelboxWorkflowActionPress, true);
+document.addEventListener('mousedown', handleLabelboxWorkflowActionPress, true);
+document.addEventListener('click', handleLabelboxWorkflowActionPress, true);
+document.addEventListener('keydown', handleLabelboxWorkflowActionKeydown, true);
 
 // Keep our widget controls responsive even when Labelbox registers broad click handlers.
 document.addEventListener('pointerdown', handleWidgetActionPress, true);
