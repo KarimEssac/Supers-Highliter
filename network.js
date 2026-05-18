@@ -2,6 +2,53 @@
     'use strict';
 
     const STORAGE_KEY = '_lbhTtMs';
+    const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'tel', 'email', 'password']);
+
+    function isTextEditingElement(el) {
+        if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+        if (el.isContentEditable) return true;
+
+        if (el.closest && el.closest('[contenteditable="true"],[contenteditable="plaintext-only"]')) {
+            return true;
+        }
+
+        if (!el.matches) return false;
+        if (el.matches('textarea')) return !el.readOnly && !el.disabled;
+        if (!el.matches('input')) return false;
+
+        const type = (el.getAttribute('type') || 'text').toLowerCase();
+        return TEXT_INPUT_TYPES.has(type) && !el.readOnly && !el.disabled;
+    }
+
+    function getEditableShiftSpaceTarget(e) {
+        if (!e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return null;
+        if (e.code !== 'Space' && e.key !== ' ' && e.key !== 'Spacebar') return null;
+
+        const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+        for (const node of path) {
+            if (node === document || node === window) break;
+            if (isTextEditingElement(node)) return node;
+        }
+
+        const target = e.target && e.target.nodeType === Node.ELEMENT_NODE
+            ? e.target
+            : e.target && e.target.parentElement;
+        if (isTextEditingElement(target)) return target;
+
+        return isTextEditingElement(document.activeElement) ? document.activeElement : null;
+    }
+
+    function blockEditableShiftSpaceShortcut(e) {
+        if (!getEditableShiftSpaceTarget(e)) return;
+
+        // Keep native space insertion, but stop Labelbox's media shortcut from seeing it.
+        e.stopImmediatePropagation();
+    }
+
+    ['keydown', 'keypress', 'keyup'].forEach(type => {
+        window.addEventListener(type, blockEditableShiftSpaceShortcut, true);
+        document.addEventListener(type, blockEditableShiftSpaceShortcut, true);
+    });
 
     function mergeRanges(ranges) {
         if (ranges.length === 0) return [];

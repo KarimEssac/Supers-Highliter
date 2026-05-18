@@ -43,6 +43,7 @@ let widgetDismissed = false;
 let networkTtMs = -1;
 // Timeline selection state (top frame only)
 let selectionDurationMs = -1;
+let selectionTotalMediaMs = -1;
 let transcriptPanelExpanded = false;
 let referenceModal = null;
 let transcriptionCapture = { rowKey: '', before: null, after: null, metrics: null };
@@ -1047,6 +1048,8 @@ function updateTranscriptionCapture() {
         transcriptionCapture = { rowKey, before: null, after: null, metrics: null };
         childFrameTranscript = { rowKey: '', savedSnapshot: null, liveSnapshot: null };
         lastSavedTranscriptionSignature = '';
+        selectionDurationMs = -1;
+        selectionTotalMediaMs = -1;
         resetTranscriptRawTextCacheIfNeeded(rowKey);
     }
 
@@ -1086,17 +1089,32 @@ function formatDuration(ms) {
 
 let cachedTotalMediaMs = 0;
 
+function parseClockTimeToMs(value) {
+    const parts = String(value || '').trim().split(':');
+    if (parts.length < 2 || parts.length > 3) return 0;
+
+    const seconds = parseFloat(parts[parts.length - 1]);
+    if (!Number.isFinite(seconds)) return 0;
+
+    const minutes = parseInt(parts[parts.length - 2], 10);
+    if (!Number.isFinite(minutes)) return 0;
+
+    const hours = parts.length === 3 ? parseInt(parts[0], 10) : 0;
+    if (!Number.isFinite(hours)) return 0;
+
+    return (hours * 3600000) + (minutes * 60000) + Math.round(seconds * 1000);
+}
+
 function getTotalMediaMs() {
     const timeEl = document.querySelector('[data-cy="editable-audio-time"]');
     if (!timeEl) return cachedTotalMediaMs;
-    const parts = (timeEl.textContent || '').split('/');
-    if (parts.length < 2) return cachedTotalMediaMs;
-    const durMatch = parts[parts.length - 1].trim().match(/(\d+):(\d+)\.(\d+)/);
-    if (!durMatch) return cachedTotalMediaMs;
-    cachedTotalMediaMs =
-        parseInt(durMatch[1], 10) * 60000 +
-        parseInt(durMatch[2], 10) * 1000 +
-        parseInt(durMatch[3], 10);
+    const matches = String(timeEl.textContent || '').match(/\d+(?::\d{1,2}){1,2}(?:\.\d+)?/g);
+    if (!matches || matches.length === 0) return cachedTotalMediaMs;
+
+    const durationMs = parseClockTimeToMs(matches[matches.length - 1]);
+    if (durationMs <= 0) return cachedTotalMediaMs;
+
+    cachedTotalMediaMs = durationMs;
     return cachedTotalMediaMs;
 }
 
@@ -1132,6 +1150,10 @@ function getSegmentTotalMs() {
     return Math.min(totalMediaMs, Math.max(0, totalMs));
 }
 
+function clampMs(value, maxMs) {
+    return Math.max(0, Math.min(Number(value) || 0, maxMs));
+}
+
 function mergeRanges(ranges) {
     if (ranges.length === 0) return [];
     const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
@@ -1151,32 +1173,83 @@ function sumRanges(ranges) {
     return ranges.reduce((sum, [start, end]) => sum + (end - start), 0);
 }
 
-// Like getSegmentTotalMs but merges overlapping segments so duplicate
-// speaker assignments don't inflate the total.
-function getDeduplicatedTtMs() {
-    const totalMediaMs = getTotalMediaMs();
-    if (totalMediaMs <= 0) return 0;
+function getTimelineItemXpx(item, containerRect) {
+    const transform = item.style && item.style.transform;
+    const translateMatch = transform && (
+        transform.match(/translateX\(([-\d.]+)px\)/)
+        || transform.match(/translate3d\(([-\d.]+)px/i)
+        || transform.match(/translate\(([-\d.]+)px/i)
+    );
+    if (translateMatch) return parseFloat(translateMatch[1]);
+
+    const rect = item.getBoundingClientRect();
+    return rect.left - containerRect.left;
+}
+
+function getDeduplicatedTimelineRangesMs(totalMediaMs = getTotalMediaMs()) {
+    if (totalMediaMs <= 0) return { ranges: [], totalMediaMs: 0, hasRanges: false };
 
     const container = getTimelineContainer();
     const containerWidth = container ? container.getBoundingClientRect().width : 0;
-    if (containerWidth < 80) return 0;
+    if (containerWidth < 80) return { ranges: [], totalMediaMs, hasRanges: false };
 
+    const containerRect = container.getBoundingClientRect();
     const msPerPx = totalMediaMs / containerWidth;
     const ranges = [];
 
     document.querySelectorAll('.vis-item').forEach(item => {
-        // Items are positioned with transform: translateX(Xpx)
-        const txMatch = item.style.transform && item.style.transform.match(/translateX\(([\d.]+)px\)/);
-        const wMatch  = item.style.width && item.style.width.match(/([\d.]+)px/);
-        if (!txMatch || !wMatch) return;
-        const startMs = parseFloat(txMatch[1]) * msPerPx;
-        const endMs   = startMs + parseFloat(wMatch[1]) * msPerPx;
+        const widthMatch = item.style.width && item.style.width.match(/([\d.]+)px/);
+        const rect = item.getBoundingClientRect();
+        const widthPx = widthMatch ? parseFloat(widthMatch[1]) : rect.width;
+        if (!Number.isFinite(widthPx) || widthPx <= 0) return;
+
+        const startPx = getTimelineItemXpx(item, containerRect);
+        if (!Number.isFinite(startPx)) return;
+
+        const startMs = clampMs(startPx * msPerPx, totalMediaMs);
+        const endMs = clampMs((startPx + widthPx) * msPerPx, totalMediaMs);
+        if (endMs <= startMs) return;
+
         ranges.push([startMs, endMs]);
     });
 
-    return Math.min(totalMediaMs, sumRanges(mergeRanges(ranges)));
+    return { ranges: mergeRanges(ranges), totalMediaMs, hasRanges: ranges.length > 0 };
 }
 
+// Like getSegmentTotalMs but merges overlapping segments so duplicate
+// speaker assignments don't inflate the total.
+function getDeduplicatedTtMs() {
+    const timeline = getDeduplicatedTimelineRangesMs();
+    if (!timeline || !timeline.hasRanges) return 0;
+    return Math.min(timeline.totalMediaMs, sumRanges(timeline.ranges));
+}
+
+function sumRangeIntersection(ranges, startMs, endMs) {
+    const selectionStart = Math.min(startMs, endMs);
+    const selectionEnd = Math.max(startMs, endMs);
+    if (selectionEnd <= selectionStart) return 0;
+
+    return ranges.reduce((sum, [rangeStart, rangeEnd]) => {
+        const overlapStart = Math.max(selectionStart, rangeStart);
+        const overlapEnd = Math.min(selectionEnd, rangeEnd);
+        return overlapEnd > overlapStart ? sum + (overlapEnd - overlapStart) : sum;
+    }, 0);
+}
+
+function getSelectedDeduplicatedTtMs(startFraction, endFraction, totalMediaMs = getTotalMediaMs()) {
+    const timeline = getDeduplicatedTimelineRangesMs(totalMediaMs);
+    if (!timeline || !timeline.hasRanges) {
+        return { durationMs: -1, totalTtMs: -1, hasRanges: false };
+    }
+
+    const startMs = clampMs(startFraction * timeline.totalMediaMs, timeline.totalMediaMs);
+    const endMs = clampMs(endFraction * timeline.totalMediaMs, timeline.totalMediaMs);
+    return {
+        durationMs: sumRangeIntersection(timeline.ranges, startMs, endMs),
+        totalTtMs: Math.min(timeline.totalMediaMs, sumRanges(timeline.ranges)),
+        hasRanges: true
+    };
+}
 
 function applyWidgetPosition(widget, x, y) {
     // Clamp so it never goes off-screen
@@ -1744,6 +1817,9 @@ function handleWidgetActionPress(e) {
     const actionEl = getWidgetActionElement(e.target);
     if (!actionEl) return false;
 
+    const widget = actionEl.closest('#lbh-word-count');
+    if (widget) suppressNextWidgetToggle(widget);
+
     e.preventDefault();
     e.stopImmediatePropagation();
     runWidgetAction(actionEl.getAttribute('data-lbh-action'));
@@ -1756,6 +1832,22 @@ function suppressWidgetActionClick(e) {
     e.preventDefault();
     e.stopImmediatePropagation();
     return true;
+}
+
+function renderSelectionSummaryHtml(dot, fallbackTotalMs = 0) {
+    if (selectionDurationMs < 0) return '';
+
+    const denominatorMs = fallbackTotalMs > 0 ? fallbackTotalMs : selectionTotalMediaMs;
+    const pct = denominatorMs > 0
+        ? Math.min(100, Math.max(0, selectionDurationMs / denominatorMs * 100))
+        : 0;
+    const pctHtml = denominatorMs > 0
+        ? dot + `<span style="color:#a78bfa;">${pct.toFixed(1)}%</span>`
+        : '';
+
+    return '<span style="color:#e5e7eb;margin-right:4px;">Sel</span>' +
+        `<span style="color:#a78bfa;font-weight:600;">${formatDuration(selectionDurationMs)}</span>` +
+        pctHtml;
 }
 
 function getAccuracyColor(accuracyPct) {
@@ -1836,6 +1928,7 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
         { side: 'after', text: afterText }
     ];
     const dot = '<span style="color:#9ca3af;margin:0 5px;">&middot;</span>';
+    const selectionHtml = renderSelectionSummaryHtml(dot, totalMs);
     let html =
         '<span style="color:#e5e7eb;margin-right:4px;">Words</span>' +
         `<span style="color:#3b82f6;font-weight:600;">${totalWords.toLocaleString()}</span>` +
@@ -1850,14 +1943,8 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionDurationMs >= 0) {
-            const pct = (selectionDurationMs / totalMs * 100).toFixed(1);
-            html +=
-                dot +
-                '<span style="color:#e5e7eb;margin-right:4px;">Sel</span>' +
-                `<span style="color:#a78bfa;font-weight:600;">${formatDuration(selectionDurationMs)}</span>` +
-                dot +
-                `<span style="color:#a78bfa;">${pct}%</span>`;
+        if (selectionHtml) {
+            html += dot + selectionHtml;
         } else {
             const fivePercMs = totalMs * 0.05;
             html +=
@@ -1865,6 +1952,8 @@ function renderWordCountWidgetLegacy(totalWords, totalSegments, totalMs) {
                 '<span style="color:#e5e7eb;margin-right:4px;">5%</span>' +
                 `<span style="color:#f59e0b;font-weight:600;">${formatDuration(fivePercMs)}</span>`;
         }
+    } else if (selectionHtml) {
+        html += '<br>' + selectionHtml;
     }
 
     if (transcriptionCapture.metrics) {
@@ -1905,6 +1994,7 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
     const dot = '<span style="color:#9ca3af;margin:0 5px;">&middot;</span>';
     const summaryAlign = 'center';
     const transcriptSections = [];
+    const selectionHtml = renderSelectionSummaryHtml(dot, totalMs);
     let summaryHtml = '';
 
     if (totalMs > 0) {
@@ -1912,14 +2002,8 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
             '<span style="color:#e5e7eb;margin-right:4px;">TT</span>' +
             `<span style="color:#10b981;font-weight:600;">${formatDuration(totalMs)}</span>`;
 
-        if (selectionDurationMs >= 0) {
-            const pct = (selectionDurationMs / totalMs * 100).toFixed(1);
-            summaryHtml +=
-                dot +
-                '<span style="color:#e5e7eb;margin-right:4px;">Sel</span>' +
-                `<span style="color:#a78bfa;font-weight:600;">${formatDuration(selectionDurationMs)}</span>` +
-                dot +
-                `<span style="color:#a78bfa;">${pct}%</span>`;
+        if (selectionHtml) {
+            summaryHtml += dot + selectionHtml;
         } else {
             const fivePercMs = totalMs * 0.05;
             summaryHtml +=
@@ -1927,6 +2011,8 @@ function renderWordCountWidget(totalWords, totalSegments, totalMs) {
                 '<span style="color:#e5e7eb;margin-right:4px;">5%</span>' +
                 `<span style="color:#f59e0b;font-weight:600;">${formatDuration(fivePercMs)}</span>`;
         }
+    } else if (selectionHtml) {
+        summaryHtml += selectionHtml;
     }
 
     if (transcriptionCapture.metrics) {
@@ -2053,7 +2139,17 @@ if (isTopFrame()) {
         } else if (e.data.type === 'LBH_TT_MS') {
             childFrameTtMs = e.data.ttMs;
         } else if (e.data.type === 'LBH_SELECTION') {
-            selectionDurationMs = e.data.durationMs;
+            const selectionTotalMs = Number.isFinite(e.data.activeTotalMs) && e.data.activeTotalMs >= 0
+                ? e.data.activeTotalMs
+                : e.data.totalMediaMs;
+            const payload = resolveSelectionPayload(
+                e.data.durationMs,
+                selectionTotalMs,
+                e.data.startFraction,
+                e.data.endFraction
+            );
+            selectionDurationMs = payload.safeDurationMs;
+            selectionTotalMediaMs = payload.safeDurationMs >= 0 ? payload.safeTotalMediaMs : -1;
             if (settings.enabled) scheduleCheck();
             return;
         } else {
@@ -2898,51 +2994,118 @@ function startHighlightWatchdog() {
 
 // ── Timeline selection tracking ───────────────────────────────────────────────
 
-// Child frames track clicks and report selection up; top frame owns the state.
+// Child frames track timeline gestures and report selection up; top frame owns the state.
 let _selectionAnchorFraction = -1;
+let _selectionRowKey = '';
 
-function publishSelectionDuration(durationMs) {
+function resolveSelectionPayload(durationMs, totalMediaMs = -1, startFraction = -1, endFraction = -1) {
+    let safeDurationMs = Number.isFinite(durationMs) ? durationMs : -1;
+    let safeTotalMediaMs = Number.isFinite(totalMediaMs) ? totalMediaMs : -1;
+    const safeStartFraction = Number.isFinite(startFraction) ? Math.max(0, Math.min(1, startFraction)) : -1;
+    const safeEndFraction = Number.isFinite(endFraction) ? Math.max(0, Math.min(1, endFraction)) : -1;
+
+    if (safeStartFraction >= 0 && safeEndFraction >= 0) {
+        const selectedTt = getSelectedDeduplicatedTtMs(safeStartFraction, safeEndFraction);
+        if (selectedTt.hasRanges) {
+            safeDurationMs = selectedTt.durationMs;
+            safeTotalMediaMs = selectedTt.totalTtMs;
+        }
+    }
+
+    if (safeDurationMs < 0 && safeStartFraction >= 0 && safeEndFraction >= 0) {
+        const fallbackTotalMediaMs = safeTotalMediaMs > 0 ? safeTotalMediaMs : getTotalMediaMs();
+        if (fallbackTotalMediaMs > 0) {
+            safeTotalMediaMs = fallbackTotalMediaMs;
+            safeDurationMs = Math.abs(safeEndFraction - safeStartFraction) * safeTotalMediaMs;
+        }
+    }
+
+    return { safeDurationMs, safeTotalMediaMs, safeStartFraction, safeEndFraction };
+}
+
+function publishSelectionDuration(durationMs, totalMediaMs = -1, startFraction = -1, endFraction = -1) {
+    const payload = resolveSelectionPayload(durationMs, totalMediaMs, startFraction, endFraction);
+
     if (isTopFrame()) {
-        selectionDurationMs = durationMs;
+        selectionDurationMs = payload.safeDurationMs;
+        selectionTotalMediaMs = payload.safeDurationMs >= 0 ? payload.safeTotalMediaMs : -1;
         scheduleCheck();
     } else {
-        try { window.parent.postMessage({ type: 'LBH_SELECTION', durationMs }, '*'); } catch (_) {}
+        try {
+            window.parent.postMessage({
+                type: 'LBH_SELECTION',
+                durationMs: payload.safeDurationMs,
+                totalMediaMs: payload.safeTotalMediaMs,
+                activeTotalMs: payload.safeTotalMediaMs,
+                startFraction: payload.safeStartFraction,
+                endFraction: payload.safeEndFraction
+            }, '*');
+        } catch (_) {}
     }
 }
 
-document.addEventListener('click', e => {
-    if (isTranscriptDisplayTextarea(e.target)) return;
+function getTimelineSelectionPoint(e) {
+    if (typeof e.button === 'number' && e.button !== 0) return undefined;
+    if (isExtensionUiElement(e.target)) return undefined;
+    if (closestFromEventTarget(e.target, 'input,textarea,select,[contenteditable="true"]')) return undefined;
+
+    const targetEl = e.target && e.target.nodeType === Node.ELEMENT_NODE
+        ? e.target
+        : e.target && e.target.parentElement;
+    const isTimelineTarget = !!(targetEl && targetEl.closest && targetEl.closest('.vis-timeline,.vis-panel,.vis-content,.vis-itemset,.vis-foreground,.vis-item'));
 
     const container = getTimelineContainer();
-    if (!container) return;
+    if (!container) return undefined;
 
     const rect = container.getBoundingClientRect();
     const edgeTolerancePx = 8;
-    const inTimeline = e.clientX >= rect.left - edgeTolerancePx && e.clientX <= rect.right + edgeTolerancePx;
+    const insideX = e.clientX >= rect.left - edgeTolerancePx && e.clientX <= rect.right + edgeTolerancePx;
+    const insideY = isTimelineTarget || rect.height <= 0 || (e.clientY >= rect.top - edgeTolerancePx && e.clientY <= rect.bottom + edgeTolerancePx);
+    if (!insideX || !insideY || rect.width <= 0) return null;
 
-    if (!inTimeline) {
+    const rawFraction = (e.clientX - rect.left) / rect.width;
+    return Math.max(0, Math.min(1, rawFraction));
+}
+
+function handleTimelineSelectionGesture(e) {
+    const rowKey = getCurrentDataRowKey();
+    if (_selectionRowKey !== rowKey) {
+        _selectionRowKey = rowKey;
+        _selectionAnchorFraction = -1;
+    }
+
+    const fraction = getTimelineSelectionPoint(e);
+
+    if (fraction === undefined) return;
+
+    if (fraction === null) {
         if (!e.shiftKey) {
             _selectionAnchorFraction = -1;
-            publishSelectionDuration(-1);
+            publishSelectionDuration(-1, -1);
         }
         return;
     }
 
-    const rawFraction = (e.clientX - rect.left) / rect.width;
-    const fraction = Math.max(0, Math.min(1, rawFraction));
-
     if (e.shiftKey) {
         const anchorFraction = _selectionAnchorFraction >= 0 ? _selectionAnchorFraction : 0;
         const totalMediaMs = getTotalMediaMs();
-        if (totalMediaMs > 0) {
+        const selectedTt = getSelectedDeduplicatedTtMs(anchorFraction, fraction, totalMediaMs);
+        if (selectedTt.hasRanges) {
+            publishSelectionDuration(selectedTt.durationMs, selectedTt.totalTtMs, anchorFraction, fraction);
+        } else if (totalMediaMs > 0) {
             const durationMs = Math.abs(fraction - anchorFraction) * totalMediaMs;
-            publishSelectionDuration(durationMs);
+            publishSelectionDuration(durationMs, totalMediaMs, anchorFraction, fraction);
+        } else {
+            publishSelectionDuration(-1, -1, anchorFraction, fraction);
         }
     } else if (!e.shiftKey) {
         _selectionAnchorFraction = fraction;
-        publishSelectionDuration(-1);
+        publishSelectionDuration(-1, -1);
     }
-});
+}
+
+document.addEventListener('pointerdown', handleTimelineSelectionGesture, true);
+document.addEventListener('click', handleTimelineSelectionGesture, true);
 
 // ── Gist Syncing (Top Frame Only) ───────────────────────────────────────────
 
@@ -3111,6 +3274,7 @@ if (!isTopFrame()) {
     try {
         window.parent.postMessage({ type: 'LBH_WORD_COUNT', words: 0, segments: 0, totalMs: 0 }, '*');
         window.parent.postMessage({ type: 'LBH_TRANSCRIPTION_STATE', rowKey: getCurrentDataRowKey(), savedSnapshot: null, liveSnapshot: null }, '*');
+        window.parent.postMessage({ type: 'LBH_SELECTION', durationMs: -1, totalMediaMs: -1, activeTotalMs: -1, startFraction: -1, endFraction: -1 }, '*');
         const ttMs = extractTtMsFromTimestamps();
         if (ttMs >= 0) {
             window.parent.postMessage({ type: 'LBH_TT_MS', ttMs }, '*');
