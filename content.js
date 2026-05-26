@@ -5,6 +5,7 @@ const DEFAULT_SETTINGS = {
     enablePunctuation: true,
     enableOrangeAngle: true,
     showRatingHelper: true,
+    enableSkipGuard: true,
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -68,6 +69,7 @@ let staleRowSnapshotSignatures = new Set();
 let saveRollbackGuard = { rowKey: '', until: 0, snapshot: null, beforeSignature: '' };
 let lastMeaningfulLiveSnapshot = null;
 let lastMeaningfulLiveSnapshotAt = 0;
+let dismissSkipGuardToast = null;
 
 // ── Word Count Widget ─────────────────────────────────────────────────────────
 
@@ -933,7 +935,7 @@ function getTranscriptTokens(text, preserveCase = false) {
     return preserveCase ? matches : matches.map(token => token.toLowerCase());
 }
 
-function levenshteinDistance(source, target) {
+function getLevenshteinOperations(source, target) {
     const a = Array.isArray(source) ? source : [];
     const b = Array.isArray(target) ? target : [];
     const rows = a.length + 1;
@@ -954,7 +956,65 @@ function levenshteinDistance(source, target) {
         }
     }
 
-    return matrix[a.length][b.length];
+    const operations = [];
+    let i = a.length;
+    let j = b.length;
+
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && a[i - 1] === b[j - 1] && matrix[i][j] === matrix[i - 1][j - 1]) {
+            i -= 1;
+            j -= 1;
+            continue;
+        }
+
+        if (i > 0 && j > 0 && matrix[i][j] === matrix[i - 1][j - 1] + 1) {
+            operations.push({ type: 'substitute', before: a[i - 1], after: b[j - 1] });
+            i -= 1;
+            j -= 1;
+            continue;
+        }
+
+        if (i > 0 && matrix[i][j] === matrix[i - 1][j] + 1) {
+            operations.push({ type: 'delete', before: a[i - 1], after: '' });
+            i -= 1;
+            continue;
+        }
+
+        if (j > 0 && matrix[i][j] === matrix[i][j - 1] + 1) {
+            operations.push({ type: 'insert', before: '', after: b[j - 1] });
+            j -= 1;
+            continue;
+        }
+
+        break;
+    }
+
+    return operations.reverse();
+}
+
+function getDeduplicatedTranscriptChangeCounts(beforeTokens, afterTokens) {
+    const wordErrors = new Set();
+    const formatErrors = new Set();
+
+    getLevenshteinOperations(beforeTokens, afterTokens).forEach(operation => {
+        const before = String(operation.before || '');
+        const after = String(operation.after || '');
+        const beforeLower = before.toLowerCase();
+        const afterLower = after.toLowerCase();
+
+        if (operation.type === 'substitute' && beforeLower === afterLower) {
+            formatErrors.add(`${operation.type}\u241f${before}\u241f${after}`);
+            return;
+        }
+
+        wordErrors.add(`${operation.type}\u241f${beforeLower}\u241f${afterLower}`);
+    });
+
+    return {
+        wordChanges: wordErrors.size,
+        formattingChanges: formatErrors.size,
+        totalChanges: wordErrors.size + formatErrors.size
+    };
 }
 
 function toAccuracyPct(total, errors) {
@@ -973,18 +1033,17 @@ function computeTranscriptionMetrics(beforeSnapshot, afterSnapshot) {
     const beforeExactTokens = getTranscriptTokens(beforeAccuracyText, true);
     const afterExactTokens = getTranscriptTokens(afterAccuracyText, true);
 
-    const wordChanges = levenshteinDistance(beforeWordTokens, afterWordTokens);
-    const exactChanges = levenshteinDistance(beforeExactTokens, afterExactTokens);
-    const formattingChanges = Math.max(0, exactChanges - wordChanges);
+    const changeCounts = getDeduplicatedTranscriptChangeCounts(beforeExactTokens, afterExactTokens);
     const baseWordCount = beforeWordTokens.length;
 
     return {
         baseWordCount,
         finalWordCount: afterWordTokens.length,
-        wordChanges,
-        formattingChanges,
-        totalAccuracyPct: toAccuracyPct(baseWordCount, exactChanges),
-        formatAccuracyPct: toAccuracyPct(baseWordCount, formattingChanges)
+        wordChanges: changeCounts.wordChanges,
+        formattingChanges: changeCounts.formattingChanges,
+        exactChanges: changeCounts.totalChanges,
+        totalAccuracyPct: toAccuracyPct(baseWordCount, changeCounts.totalChanges),
+        formatAccuracyPct: toAccuracyPct(baseWordCount, changeCounts.formattingChanges)
     };
 }
 
@@ -2523,6 +2582,7 @@ function normalizeSettings(raw) {
         enablePunctuation: raw.enablePunctuation !== false,
         enableOrangeAngle: raw.enableOrangeAngle !== false,
         showRatingHelper: raw.showRatingHelper !== false,
+        enableSkipGuard: raw.enableSkipGuard !== false,
         wordsToHighlight: wordsToHighlight.length ? wordsToHighlight : [...DEFAULT_SETTINGS.wordsToHighlight],
         wordsToHighlightCaseSensitive: wordsToHighlightCaseSensitive.length ? wordsToHighlightCaseSensitive : [...DEFAULT_SETTINGS.wordsToHighlightCaseSensitive],
         remoteRemoved: sanitizeStringArray(raw.remoteRemoved, []),
@@ -3544,6 +3604,10 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     if (!hasRelevantChange) return;
 
     settings = normalizeSettings(updated);
+    if (!settings.enableSkipGuard && typeof dismissSkipGuardToast === 'function') {
+        dismissSkipGuardToast();
+    }
+
     if (!settings.enabled) {
         clearAllHighlights();
         return;
@@ -3750,6 +3814,11 @@ if (!isTopFrame()) {
         clearTimeout(dismissTimer);
         pendingSkipFn = null;
     }
+    dismissSkipGuardToast = dismiss;
+
+    function isSkipGuardEnabled() {
+        return settings.enableSkipGuard !== false;
+    }
 
     function showConfirm(doSkip) {
         pendingSkipFn = doSkip;
@@ -3785,6 +3854,10 @@ if (!isTopFrame()) {
     confirmBtn.addEventListener('click', e => {
         e.preventDefault();
         e.stopPropagation();
+        if (!isSkipGuardEnabled()) {
+            dismiss();
+            return;
+        }
         const doSkip = pendingSkipFn;
         dismiss();
         if (doSkip) doSkip();
@@ -3797,6 +3870,10 @@ if (!isTopFrame()) {
     });
 
     document.addEventListener('click', e => {
+        if (!isSkipGuardEnabled()) {
+            dismiss();
+            return;
+        }
         if (closestFromEventTarget(e.target, '#lbsg-toast')) return;
         const skipButton = findSkipButton();
         if (!skipButton) return;
@@ -3817,6 +3894,10 @@ if (!isTopFrame()) {
     }
 
     document.addEventListener('keydown', e => {
+        if (!isSkipGuardEnabled()) {
+            dismiss();
+            return;
+        }
         if (!isSkipKey(e)) return;
         const skipButton = findSkipButton();
         if (!skipButton) return;
@@ -3828,6 +3909,7 @@ if (!isTopFrame()) {
 
     ['keypress', 'keyup'].forEach(eventType => {
         document.addEventListener(eventType, e => {
+            if (!isSkipGuardEnabled()) return;
             if (!isSkipKey(e)) return;
             const skipButton = findSkipButton();
             if (!skipButton) return;

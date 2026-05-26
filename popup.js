@@ -6,6 +6,7 @@ const DEFAULT_SETTINGS = {
     enableGKLookup: true,
     enableTabDedup: true,
     showRatingHelper: true,
+    enableSkipGuard: true,
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -18,6 +19,7 @@ const elements = {
     enableGKLookup: document.getElementById('enableGKLookup'),
     enableTabDedup: document.getElementById('enableTabDedup'),
     showRatingHelper: document.getElementById('showRatingHelper'),
+    enableSkipGuard: document.getElementById('enableSkipGuard'),
     wordsToHighlight: document.getElementById('wordsToHighlight'),
     wordsToHighlightCaseSensitive: document.getElementById('wordsToHighlightCaseSensitive'),
     save: document.getElementById('save'),
@@ -105,6 +107,7 @@ function render(settings) {
     elements.enableGKLookup.checked = settings.enableGKLookup;
     elements.enableTabDedup.checked = settings.enableTabDedup;
     elements.showRatingHelper.checked = settings.showRatingHelper;
+    elements.enableSkipGuard.checked = settings.enableSkipGuard;
     elements.wordsToHighlight.value = toCsv(settings.wordsToHighlight);
     elements.wordsToHighlightCaseSensitive.value = toCsv(settings.wordsToHighlightCaseSensitive);
 
@@ -120,6 +123,7 @@ function collectSettingsFromForm() {
         enableGKLookup: elements.enableGKLookup.checked,
         enableTabDedup: elements.enableTabDedup.checked,
         showRatingHelper: elements.showRatingHelper.checked,
+        enableSkipGuard: elements.enableSkipGuard.checked,
         wordsToHighlight: parseCsv(elements.wordsToHighlight.value),
         wordsToHighlightCaseSensitive: parseCsv(elements.wordsToHighlightCaseSensitive.value)
     };
@@ -144,6 +148,12 @@ function saveRatingHelperVisibility() {
     });
 }
 
+function saveSkipGuardToggle() {
+    chrome.storage.local.set({ enableSkipGuard: elements.enableSkipGuard.checked }, () => {
+        showStatus('Saved');
+    });
+}
+
 chrome.storage.local.get(DEFAULT_SETTINGS, stored => {
     const initialSettings = { ...DEFAULT_SETTINGS, ...stored };
     render(initialSettings);
@@ -154,6 +164,7 @@ chrome.storage.local.set({ _lbhWidgetHidden: false });
 
 elements.save.addEventListener('click', save);
 elements.showRatingHelper.addEventListener('change', saveRatingHelperVisibility);
+elements.enableSkipGuard.addEventListener('change', saveSkipGuardToggle);
 
 // ── GK Lookup ─────────────────────────────────────────────────────────────────
 
