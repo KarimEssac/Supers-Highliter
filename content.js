@@ -34,6 +34,8 @@ const WIDGET_EXPANDED_DEFAULT_WIDTH_PX = 520;
 const WIDGET_EXPANDED_DEFAULT_HEIGHT_PX = 430;
 const STALE_ROW_SNAPSHOT_REJECT_MS = 7000;
 const SAVE_ROLLBACK_GUARD_MS = 10000;
+const GHOST_SEGMENT_END_MIN_TOLERANCE_MS = 1500;
+const GHOST_SEGMENT_END_MAX_TOLERANCE_MS = 5000;
 
 let settings = { ...DEFAULT_SETTINGS, remoteRemoved: [], remoteCommunityAudit: [], remoteSrFlag: [] };
 let isCheckScheduled = false;
@@ -749,10 +751,14 @@ function getSavedTranscriptSegments(savedElements = getSavedTranscriptElements()
         const speakerNumber = itemSpeakerNumbers.get(item) || null;
         const domText = el.textContent || '';
         const cacheKey = getTranscriptSegmentCacheKey(index, item);
+        const timing = getTimelineSegmentTiming(item);
         return {
             text: cacheMode ? getCachedTranscriptText(cacheKey, domText, cacheMode) : domText,
             role: getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers),
-            speakerNumber
+            speakerNumber,
+            startMs: timing ? timing.startMs : null,
+            endMs: timing ? timing.endMs : null,
+            isAtAudioEnd: timing ? timing.isAtAudioEnd : false
         };
     });
 }
@@ -765,9 +771,13 @@ function getTranscriptSpeakerInfoForTextarea(textarea) {
     const allItems = getVisibleTranscriptTimelineItems([item]);
     const itemSpeakerNumbers = getSpeakerNumbersForTimelineItems(allItems);
     const speakerNumber = itemSpeakerNumbers.get(item) || null;
+    const timing = getTimelineSegmentTiming(item);
     return {
         role: getRoleForTimelineItem(item, roleMap, itemSpeakerNumbers),
-        speakerNumber
+        speakerNumber,
+        startMs: timing ? timing.startMs : null,
+        endMs: timing ? timing.endMs : null,
+        isAtAudioEnd: timing ? timing.isAtAudioEnd : false
     };
 }
 
@@ -779,56 +789,64 @@ function getTranscriptTokenMatches(text) {
     return [...String(text || '').matchAll(/[A-Za-z0-9]+(?:['\u2019-][A-Za-z0-9]+)*/g)];
 }
 
-function stripRepeatedGhostText(text) {
-    let value = normalizeSegmentText(text);
-
-    for (let pass = 0; pass < 3; pass += 1) {
-        const matches = getTranscriptTokenMatches(value);
-        if (matches.length < 2 || matches.length % 2 !== 0) break;
-
-        const half = matches.length / 2;
-        const firstTokens = matches.slice(0, half).map(match => match[0].toLowerCase());
-        const secondTokens = matches.slice(half).map(match => match[0].toLowerCase());
-        const isDuplicate = firstTokens.every((token, index) => token === secondTokens[index]);
-        if (!isDuplicate) break;
-
-        const firstHalfText = value.slice(0, matches[half].index).trim();
-        const firstHalfTokenText = firstTokens.join(' ');
-        if (firstHalfText.length < 8 && firstTokens.length < 2) break;
-
-        value = firstHalfText || firstHalfTokenText;
-    }
-
-    return value;
-}
-
 function getGhostSegmentFingerprint(segment) {
     return getTranscriptTokenMatches(segment.text)
         .map(match => match[0].toLowerCase())
         .join(' ');
 }
 
-function isDuplicateGhostSegment(previous, current) {
-    if (!previous || !current) return false;
-    const previousFingerprint = getGhostSegmentFingerprint(previous);
-    if (!previousFingerprint || previousFingerprint !== getGhostSegmentFingerprint(current)) return false;
+function getGhostSegmentEndToleranceMs(totalMediaMs) {
+    return Math.max(
+        GHOST_SEGMENT_END_MIN_TOLERANCE_MS,
+        Math.min(GHOST_SEGMENT_END_MAX_TOLERANCE_MS, totalMediaMs * 0.005)
+    );
+}
 
-    if (Number.isFinite(previous.speakerNumber) && Number.isFinite(current.speakerNumber) && previous.speakerNumber !== current.speakerNumber) {
-        return false;
-    }
+function getTimelineSegmentTiming(item) {
+    const totalMediaMs = getTotalMediaMs();
+    if (!item || totalMediaMs <= 0) return null;
 
-    const previousRole = normalizeSpeakerRole(previous.role);
-    const currentRole = normalizeSpeakerRole(current.role);
-    return !previousRole || !currentRole || previousRole === currentRole;
+    const container = getTimelineContainer();
+    const containerRect = container ? container.getBoundingClientRect() : null;
+    const containerWidth = containerRect ? containerRect.width : 0;
+    if (!containerRect || containerWidth < 80) return null;
+
+    const rect = item.getBoundingClientRect();
+    const widthMatch = item.style.width && item.style.width.match(/([\d.]+)px/);
+    const widthPx = widthMatch ? parseFloat(widthMatch[1]) : rect.width;
+    if (!Number.isFinite(widthPx) || widthPx <= 0) return null;
+
+    const startPx = getTimelineItemXpx(item, containerRect);
+    if (!Number.isFinite(startPx)) return null;
+
+    const msPerPx = totalMediaMs / containerWidth;
+    const startMs = clampMs(startPx * msPerPx, totalMediaMs);
+    const endMs = clampMs((startPx + widthPx) * msPerPx, totalMediaMs);
+    if (endMs <= startMs) return null;
+
+    return {
+        startMs,
+        endMs,
+        totalMediaMs,
+        isAtAudioEnd: totalMediaMs - endMs <= getGhostSegmentEndToleranceMs(totalMediaMs)
+    };
 }
 
 function removeDuplicateGhostSegments(segments) {
+    const seenBySpeakerAndText = new Set();
     const deduped = [];
 
     segments.forEach(segment => {
-        const previous = deduped[deduped.length - 1];
-        if (isDuplicateGhostSegment(previous, segment)) return;
+        const fingerprint = getGhostSegmentFingerprint(segment);
+        const key = Number.isFinite(segment.speakerNumber) && fingerprint
+            ? `${segment.speakerNumber}\u241f${fingerprint}`
+            : '';
+        const isTerminalDuplicate = segment.isAtAudioEnd === true && key && seenBySpeakerAndText.has(key);
+
+        if (isTerminalDuplicate) return;
+
         deduped.push(segment);
+        if (key) seenBySpeakerAndText.add(key);
     });
 
     return deduped;
@@ -839,16 +857,22 @@ function buildSnapshotFromSegments(segments) {
         .map(segment => {
             if (segment && typeof segment === 'object') {
                 return {
-                    text: stripRepeatedGhostText(segment.text),
+                    text: normalizeSegmentText(segment.text),
                     role: normalizeSpeakerRole(segment.role),
-                    speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null
+                    speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null,
+                    startMs: Number.isFinite(segment.startMs) ? segment.startMs : null,
+                    endMs: Number.isFinite(segment.endMs) ? segment.endMs : null,
+                    isAtAudioEnd: segment.isAtAudioEnd === true
                 };
             }
 
             return {
-                text: stripRepeatedGhostText(segment),
+                text: normalizeSegmentText(segment),
                 role: '',
-                speakerNumber: null
+                speakerNumber: null,
+                startMs: null,
+                endMs: null,
+                isAtAudioEnd: false
             };
         })
         .filter(segment => segment.text.length > 0));
@@ -887,7 +911,10 @@ function buildLiveTranscriptSnapshot() {
         const mergedSegments = savedSegments.map(segment => ({
             text: normalizeSegmentText(segment.text),
             role: normalizeSpeakerRole(segment.role),
-            speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null
+            speakerNumber: Number.isFinite(segment.speakerNumber) ? segment.speakerNumber : null,
+            startMs: Number.isFinite(segment.startMs) ? segment.startMs : null,
+            endMs: Number.isFinite(segment.endMs) ? segment.endMs : null,
+            isAtAudioEnd: segment.isAtAudioEnd === true
         }));
         if (activeTextarea) {
             const liveText = normalizeSegmentText(activeTextarea.value || '');
@@ -926,7 +953,10 @@ function buildLiveTranscriptSnapshot() {
     return buildSnapshotFromSegments([{
         text: activeText,
         role: speakerInfo.role,
-        speakerNumber: speakerInfo.speakerNumber
+        speakerNumber: speakerInfo.speakerNumber,
+        startMs: speakerInfo.startMs,
+        endMs: speakerInfo.endMs,
+        isAtAudioEnd: speakerInfo.isAtAudioEnd
     }]);
 }
 
@@ -993,8 +1023,9 @@ function getLevenshteinOperations(source, target) {
 }
 
 function getDeduplicatedTranscriptChangeCounts(beforeTokens, afterTokens) {
-    const wordErrors = new Set();
-    const formatErrors = new Set();
+    const substitutionErrors = new Set();
+    let wordChanges = 0;
+    let formattingChanges = 0;
 
     getLevenshteinOperations(beforeTokens, afterTokens).forEach(operation => {
         const before = String(operation.before || '');
@@ -1003,17 +1034,24 @@ function getDeduplicatedTranscriptChangeCounts(beforeTokens, afterTokens) {
         const afterLower = after.toLowerCase();
 
         if (operation.type === 'substitute' && beforeLower === afterLower) {
-            formatErrors.add(`${operation.type}\u241f${before}\u241f${after}`);
+            formattingChanges += 1;
             return;
         }
 
-        wordErrors.add(`${operation.type}\u241f${beforeLower}\u241f${afterLower}`);
+        if (operation.type === 'substitute') {
+            substitutionErrors.add(`${beforeLower}\u241f${afterLower}`);
+            return;
+        }
+
+        wordChanges += 1;
     });
 
+    wordChanges += substitutionErrors.size;
+
     return {
-        wordChanges: wordErrors.size,
-        formattingChanges: formatErrors.size,
-        totalChanges: wordErrors.size + formatErrors.size
+        wordChanges,
+        formattingChanges,
+        totalChanges: wordChanges + formattingChanges
     };
 }
 
