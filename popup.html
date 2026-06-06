@@ -145,6 +145,25 @@
         </label>
       </section>
 
+      <section class="group">
+        <div class="config-section-title">Text Shortcuts</div>
+        <div class="shortcut-row">
+          <div class="shortcut-copy">
+            <span class="shortcut-name">Toggle lower/upper case</span>
+            <span id="toggleCaseShortcutDisplay" class="shortcut-value"></span>
+          </div>
+          <button id="setToggleCaseShortcut" type="button">Set Shortcut</button>
+        </div>
+        <div class="shortcut-row">
+          <div class="shortcut-copy">
+            <span class="shortcut-name">Title Case</span>
+            <span id="titleCaseShortcutDisplay" class="shortcut-value"></span>
+          </div>
+          <button id="setTitleCaseShortcut" type="button">Set Shortcut</button>
+        </div>
+        <span id="shortcut-status" aria-live="polite"></span>
+      </section>
+
       <div class="row actions">
         <button id="save" type="button">Save</button>
         <span id="status" aria-live="polite"></span>

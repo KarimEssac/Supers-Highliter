@@ -6,6 +6,8 @@ const DEFAULT_SETTINGS = {
     enableOrangeAngle: true,
     showRatingHelper: true,
     enableSkipGuard: true,
+    toggleCaseShortcut: ['Shift', 'Equal'],
+    titleCaseShortcut: ['Shift', 'Minus'],
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -72,6 +74,144 @@ let saveRollbackGuard = { rowKey: '', until: 0, snapshot: null, beforeSignature:
 let lastMeaningfulLiveSnapshot = null;
 let lastMeaningfulLiveSnapshotAt = 0;
 let dismissSkipGuardToast = null;
+
+function getLetterCaseCounts(text) {
+    let lowercase = 0;
+    let uppercase = 0;
+
+    for (const char of text) {
+        const lower = char.toLowerCase();
+        const upper = char.toUpperCase();
+        if (lower === upper) continue;
+        if (char === lower) lowercase++;
+        else if (char === upper) uppercase++;
+    }
+
+    return { lowercase, uppercase };
+}
+
+function toggleSelectedTextCaseValue(text) {
+    const counts = getLetterCaseCounts(text);
+    if (!counts.lowercase && !counts.uppercase) return text;
+    return counts.lowercase >= counts.uppercase
+        ? text.toUpperCase()
+        : text.toLowerCase();
+}
+
+function toTitleCaseValue(text) {
+    return text.toLowerCase().replace(/\b([a-z])([a-z]*)/gi, (_, first, rest) => {
+        return first.toUpperCase() + rest;
+    });
+}
+
+function dispatchTextEditInputEvent(el) {
+    try {
+        el.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            cancelable: true,
+            inputType: 'insertText'
+        }));
+    } catch (_) {
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+}
+
+function transformTextControlSelection(control, transformText) {
+    if (!control || typeof control.selectionStart !== 'number' || typeof control.selectionEnd !== 'number') return false;
+    const start = control.selectionStart;
+    const end = control.selectionEnd;
+    if (start === end) return false;
+
+    const selectedText = control.value.slice(start, end);
+    const updatedText = transformText(selectedText);
+    if (updatedText === selectedText) return false;
+
+    control.setRangeText(updatedText, start, end, 'select');
+    dispatchTextEditInputEvent(control);
+    return true;
+}
+
+function transformContentEditableSelection(selection, transformText) {
+    if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return false;
+
+    const range = selection.getRangeAt(0);
+    const container = range.commonAncestorContainer;
+    const editable = container.nodeType === Node.ELEMENT_NODE
+        ? container.closest('[contenteditable="true"]')
+        : container.parentElement && container.parentElement.closest('[contenteditable="true"]');
+    if (!editable) return false;
+
+    const selectedText = selection.toString();
+    const updatedText = transformText(selectedText);
+    if (updatedText === selectedText) return false;
+
+    range.deleteContents();
+    const textNode = document.createTextNode(updatedText);
+    range.insertNode(textNode);
+
+    const updatedRange = document.createRange();
+    updatedRange.selectNodeContents(textNode);
+    selection.removeAllRanges();
+    selection.addRange(updatedRange);
+    dispatchTextEditInputEvent(editable);
+    return true;
+}
+
+function normalizeShortcut(value, fallback) {
+    if (!Array.isArray(value)) return [...fallback];
+    const keys = value
+        .map(key => (typeof key === 'string' ? key.trim() : ''))
+        .filter(Boolean);
+    return keys.length >= 1 && keys.length <= 2 ? keys : [...fallback];
+}
+
+function shortcutFromKeyboardEvent(e) {
+    const keys = [];
+    if (e.ctrlKey || e.key === 'Control') keys.push('Control');
+    if (e.altKey || e.key === 'Alt') keys.push('Alt');
+    if (e.shiftKey || e.key === 'Shift') keys.push('Shift');
+    if (e.metaKey || e.key === 'Meta') keys.push('Meta');
+
+    const code = e.code || e.key;
+    if (!['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(code)) {
+        keys.push(code);
+    }
+
+    return [...new Set(keys.map(key => key.replace(/Left$|Right$/, '')))];
+}
+
+function shortcutsMatch(eventKeys, shortcutKeys) {
+    if (eventKeys.length !== shortcutKeys.length) return false;
+    return shortcutKeys.every(key => eventKeys.includes(key));
+}
+
+function applySelectionTextTransform(target, transformText) {
+    const textControl = closestFromEventTarget(target || document.activeElement, 'textarea,input[type="text"],input[type="search"],input[type="email"],input[type="url"],input[type="tel"],input:not([type])');
+    return textControl
+        ? transformTextControlSelection(textControl, transformText)
+        : transformContentEditableSelection(window.getSelection && window.getSelection(), transformText);
+}
+
+function handleSelectionCaseShortcut(e) {
+    const eventKeys = shortcutFromKeyboardEvent(e);
+    const toggleShortcut = normalizeShortcut(settings.toggleCaseShortcut, DEFAULT_SETTINGS.toggleCaseShortcut);
+    const titleShortcut = normalizeShortcut(settings.titleCaseShortcut, DEFAULT_SETTINGS.titleCaseShortcut);
+    let transformText = null;
+
+    if (shortcutsMatch(eventKeys, toggleShortcut)) {
+        transformText = toggleSelectedTextCaseValue;
+    } else if (shortcutsMatch(eventKeys, titleShortcut)) {
+        transformText = toTitleCaseValue;
+    }
+
+    if (!transformText) return;
+
+    const changed = applySelectionTextTransform(e.target, transformText);
+
+    if (!changed) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+}
 
 // ── Word Count Widget ─────────────────────────────────────────────────────────
 
@@ -2621,6 +2761,8 @@ function normalizeSettings(raw) {
         enableOrangeAngle: raw.enableOrangeAngle !== false,
         showRatingHelper: raw.showRatingHelper !== false,
         enableSkipGuard: raw.enableSkipGuard !== false,
+        toggleCaseShortcut: normalizeShortcut(raw.toggleCaseShortcut, DEFAULT_SETTINGS.toggleCaseShortcut),
+        titleCaseShortcut: normalizeShortcut(raw.titleCaseShortcut, DEFAULT_SETTINGS.titleCaseShortcut),
         wordsToHighlight: wordsToHighlight.length ? wordsToHighlight : [...DEFAULT_SETTINGS.wordsToHighlight],
         wordsToHighlightCaseSensitive: wordsToHighlightCaseSensitive.length ? wordsToHighlightCaseSensitive : [...DEFAULT_SETTINGS.wordsToHighlightCaseSensitive],
         remoteRemoved: sanitizeStringArray(raw.remoteRemoved, []),
@@ -3664,6 +3806,7 @@ document.addEventListener('change', handlePageInputOrChange);
 document.addEventListener('pointerdown', handleLabelboxWorkflowActionPress, true);
 document.addEventListener('mousedown', handleLabelboxWorkflowActionPress, true);
 document.addEventListener('click', handleLabelboxWorkflowActionPress, true);
+document.addEventListener('keydown', handleSelectionCaseShortcut, true);
 document.addEventListener('keydown', handleLabelboxWorkflowActionKeydown, true);
 
 // Keep our widget controls responsive even when Labelbox registers broad click handlers.

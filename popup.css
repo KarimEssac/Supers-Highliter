@@ -207,6 +207,59 @@ button:hover {
   margin-bottom: 10px;
 }
 
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid #2a3240;
+}
+
+.shortcut-row:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.shortcut-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.shortcut-name {
+  font-size: 14px;
+  color: #ffffff;
+}
+
+.shortcut-value {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.shortcut-row button {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  background: #1e2736;
+  border-color: #344154;
+  color: #e5e7eb;
+}
+
+.shortcut-row button:hover {
+  background: #2a3240;
+  border-color: #4b5563;
+  color: #ffffff;
+}
+
+#shortcut-status {
+  display: block;
+  min-height: 18px;
+  margin-top: 4px;
+  font-size: 13px;
+  color: #e5e7eb;
+}
+
 .status-dot {
   display: inline-block;
   width: 8px;

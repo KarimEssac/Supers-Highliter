@@ -7,6 +7,8 @@ const DEFAULT_SETTINGS = {
     enableTabDedup: true,
     showRatingHelper: true,
     enableSkipGuard: true,
+    toggleCaseShortcut: ['Shift', 'Equal'],
+    titleCaseShortcut: ['Shift', 'Minus'],
     wordsToHighlight: ["niner", "alpha", "fourty", "romeu", "ninty", "juliet"],
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
@@ -22,6 +24,11 @@ const elements = {
     enableSkipGuard: document.getElementById('enableSkipGuard'),
     wordsToHighlight: document.getElementById('wordsToHighlight'),
     wordsToHighlightCaseSensitive: document.getElementById('wordsToHighlightCaseSensitive'),
+    toggleCaseShortcutDisplay: document.getElementById('toggleCaseShortcutDisplay'),
+    titleCaseShortcutDisplay: document.getElementById('titleCaseShortcutDisplay'),
+    setToggleCaseShortcut: document.getElementById('setToggleCaseShortcut'),
+    setTitleCaseShortcut: document.getElementById('setTitleCaseShortcut'),
+    shortcutStatus: document.getElementById('shortcut-status'),
     save: document.getElementById('save'),
     status: document.getElementById('status')
 };
@@ -99,6 +106,78 @@ function toCsv(values) {
     return values.join(', ');
 }
 
+const SHORTCUT_LABELS = {
+    Shift: 'Shift',
+    Alt: 'Alt',
+    Control: 'Ctrl',
+    Meta: 'Meta',
+    Equal: 'Plus',
+    Minus: 'Minus',
+    Space: 'Space',
+    Escape: 'Esc',
+    ArrowUp: 'Up',
+    ArrowDown: 'Down',
+    ArrowLeft: 'Left',
+    ArrowRight: 'Right',
+    Digit0: '0',
+    Digit1: '1',
+    Digit2: '2',
+    Digit3: '3',
+    Digit4: '4',
+    Digit5: '5',
+    Digit6: '6',
+    Digit7: '7',
+    Digit8: '8',
+    Digit9: '9'
+};
+
+let currentShortcutSettings = {
+    toggleCaseShortcut: [...DEFAULT_SETTINGS.toggleCaseShortcut],
+    titleCaseShortcut: [...DEFAULT_SETTINGS.titleCaseShortcut]
+};
+let recordingShortcutKey = '';
+let recordingShortcutTimer = null;
+
+function normalizeShortcut(value, fallback) {
+    if (!Array.isArray(value)) return [...fallback];
+    const keys = value
+        .map(key => (typeof key === 'string' ? key.trim() : ''))
+        .filter(Boolean);
+    return keys.length >= 1 && keys.length <= 2 ? keys : [...fallback];
+}
+
+function shortcutFromEvent(e) {
+    const keys = [];
+    if (e.ctrlKey || e.key === 'Control') keys.push('Control');
+    if (e.altKey || e.key === 'Alt') keys.push('Alt');
+    if (e.shiftKey || e.key === 'Shift') keys.push('Shift');
+    if (e.metaKey || e.key === 'Meta') keys.push('Meta');
+
+    const code = e.code || e.key;
+    if (!['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight', 'MetaLeft', 'MetaRight'].includes(code)) {
+        keys.push(code);
+    }
+
+    const unique = [...new Set(keys.map(key => key.replace(/Left$|Right$/, '')))];
+    return unique.length >= 1 && unique.length <= 2 ? unique : null;
+}
+
+function formatShortcut(keys) {
+    return normalizeShortcut(keys, []).map(key => {
+        if (SHORTCUT_LABELS[key]) return SHORTCUT_LABELS[key];
+        if (/^Key[A-Z]$/.test(key)) return key.slice(3);
+        if (/^Numpad\d$/.test(key)) return key.slice(6);
+        return key.replace(/^Digit/, '');
+    }).join(' + ');
+}
+
+function renderShortcuts(settings) {
+    currentShortcutSettings.toggleCaseShortcut = normalizeShortcut(settings.toggleCaseShortcut, DEFAULT_SETTINGS.toggleCaseShortcut);
+    currentShortcutSettings.titleCaseShortcut = normalizeShortcut(settings.titleCaseShortcut, DEFAULT_SETTINGS.titleCaseShortcut);
+    elements.toggleCaseShortcutDisplay.textContent = formatShortcut(currentShortcutSettings.toggleCaseShortcut);
+    elements.titleCaseShortcutDisplay.textContent = formatShortcut(currentShortcutSettings.titleCaseShortcut);
+}
+
 function render(settings) {
     elements.enableCaseInsensitiveWords.checked = settings.enableCaseInsensitiveWords;
     elements.enableCaseSensitiveWords.checked = settings.enableCaseSensitiveWords;
@@ -110,6 +189,7 @@ function render(settings) {
     elements.enableSkipGuard.checked = settings.enableSkipGuard;
     elements.wordsToHighlight.value = toCsv(settings.wordsToHighlight);
     elements.wordsToHighlightCaseSensitive.value = toCsv(settings.wordsToHighlightCaseSensitive);
+    renderShortcuts(settings);
 
     gkEl.panel.classList.toggle('hidden', !settings.enableGKLookup);
 }
@@ -124,6 +204,8 @@ function collectSettingsFromForm() {
         enableTabDedup: elements.enableTabDedup.checked,
         showRatingHelper: elements.showRatingHelper.checked,
         enableSkipGuard: elements.enableSkipGuard.checked,
+        toggleCaseShortcut: [...currentShortcutSettings.toggleCaseShortcut],
+        titleCaseShortcut: [...currentShortcutSettings.titleCaseShortcut],
         wordsToHighlight: parseCsv(elements.wordsToHighlight.value),
         wordsToHighlightCaseSensitive: parseCsv(elements.wordsToHighlightCaseSensitive.value)
     };
@@ -154,6 +236,70 @@ function saveSkipGuardToggle() {
     });
 }
 
+function finishShortcutRecording(shortcut) {
+    if (!recordingShortcutKey) return;
+    if (recordingShortcutTimer) {
+        clearTimeout(recordingShortcutTimer);
+        recordingShortcutTimer = null;
+    }
+
+    currentShortcutSettings[recordingShortcutKey] = shortcut;
+    chrome.storage.local.set({ [recordingShortcutKey]: shortcut }, () => {
+        renderShortcuts(currentShortcutSettings);
+        setShortcutStatus(`Saved ${formatShortcut(shortcut)}`, '#34d399');
+    });
+
+    recordingShortcutKey = '';
+    elements.setToggleCaseShortcut.disabled = false;
+    elements.setTitleCaseShortcut.disabled = false;
+}
+
+function startShortcutRecording(settingKey) {
+    if (recordingShortcutTimer) {
+        clearTimeout(recordingShortcutTimer);
+        recordingShortcutTimer = null;
+    }
+    recordingShortcutKey = settingKey;
+    elements.setToggleCaseShortcut.disabled = settingKey !== 'toggleCaseShortcut';
+    elements.setTitleCaseShortcut.disabled = settingKey !== 'titleCaseShortcut';
+    setShortcutStatus('Press 1 or 2 keys...', '#e5e7eb', 0);
+}
+
+function handleShortcutRecordingKeydown(e) {
+    if (!recordingShortcutKey) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (e.key === 'Escape') {
+        if (recordingShortcutTimer) {
+            clearTimeout(recordingShortcutTimer);
+            recordingShortcutTimer = null;
+        }
+        recordingShortcutKey = '';
+        elements.setToggleCaseShortcut.disabled = false;
+        elements.setTitleCaseShortcut.disabled = false;
+        setShortcutStatus('Canceled', '#f87171');
+        return;
+    }
+
+    const shortcut = shortcutFromEvent(e);
+    if (!shortcut) {
+        setShortcutStatus('Use up to 2 keys', '#f87171', 2200);
+        return;
+    }
+
+    if (shortcut.length === 2) {
+        finishShortcutRecording(shortcut);
+        return;
+    }
+
+    setShortcutStatus(`Captured ${formatShortcut(shortcut)}...`, '#e5e7eb', 0);
+    if (recordingShortcutTimer) clearTimeout(recordingShortcutTimer);
+    recordingShortcutTimer = setTimeout(() => {
+        finishShortcutRecording(shortcut);
+    }, 650);
+}
+
 chrome.storage.local.get(DEFAULT_SETTINGS, stored => {
     const initialSettings = { ...DEFAULT_SETTINGS, ...stored };
     render(initialSettings);
@@ -165,6 +311,9 @@ chrome.storage.local.set({ _lbhWidgetHidden: false });
 elements.save.addEventListener('click', save);
 elements.showRatingHelper.addEventListener('change', saveRatingHelperVisibility);
 elements.enableSkipGuard.addEventListener('change', saveSkipGuardToggle);
+elements.setToggleCaseShortcut.addEventListener('click', () => startShortcutRecording('toggleCaseShortcut'));
+elements.setTitleCaseShortcut.addEventListener('click', () => startShortcutRecording('titleCaseShortcut'));
+window.addEventListener('keydown', handleShortcutRecordingKeydown, true);
 
 // ── GK Lookup ─────────────────────────────────────────────────────────────────
 
@@ -365,6 +514,10 @@ function setStatus(el, text, color, duration = 1500) {
 
 function showStatus(message) {
     setStatus(elements.status, message, '#34d399');
+}
+
+function setShortcutStatus(message, color = '#e5e7eb', duration = 1800) {
+    setStatus(elements.shortcutStatus, message, color, duration);
 }
 
 function setRemoteStatus(text, color) {
