@@ -12,7 +12,7 @@ const DEFAULT_SETTINGS = {
     wordsToHighlightCaseSensitive: ["alfa", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "x-ray", "yankee", "zulu", "HEAVY", "Tower", "Approach", "Center", "Departure", "I", "It", "rnav", "rnp", "ils"]
 };
 
-const nonAnglePunctuationRegex = /[!"#$%&()*+/:;=?@[\\\]^_`{|}~-]/g;
+const nonAnglePunctuationRegex = /[!"#$%&()*+/:;=?@[\\\]^_`{|}~]/g;
 const permittedBracketOnlyTexts = [
     "[unintelligible]",
     "[overlap talking]"
