@@ -3809,6 +3809,215 @@ document.addEventListener('click', handleLabelboxWorkflowActionPress, true);
 document.addEventListener('keydown', handleSelectionCaseShortcut, true);
 document.addEventListener('keydown', handleLabelboxWorkflowActionKeydown, true);
 
+// ── Tab+Arrow: Jump Between Segments Of The Same Speaker ───────────────────
+//
+// While editing a transcript segment, holding Tab and pressing Left/Right
+// Arrow moves the selection to the previous/next segment belonging to the
+// SAME speaker (chronological order), skipping over segments from other
+// speakers. Up/Down arrows are intentionally left untouched.
+//
+// Mechanics (verified against the live Labelbox timeline):
+//   - The currently active/edited segment is reflected by `.vis-item.vis-selected`.
+//   - Its speaker is the `.vis-group` it belongs to, matched against the
+//     `.vis-label` sidebar text via getSpeakerNumbersForTimelineItems().
+//   - Changing selection to another segment requires a simulated real
+//     pointer/mouse interaction on that segment's `.vis-item` (Labelbox's
+//     vis-timeline manages selection internally; toggling a CSS class or
+//     calling .focus() alone does not register as a selection change).
+//     A pointerdown -> mousedown -> mouseup -> click sequence reproduces a
+//     real click and Labelbox responds by re-focusing its own classification
+//     textarea on the newly selected segment automatically.
+
+let lbhTabHeldForSegmentNav = false;
+
+function getCurrentlySelectedTimelineItem() {
+    return document.querySelector('.vis-item.vis-selected');
+}
+
+function getAllTimelineItemsForNav() {
+    return [...document.querySelectorAll('.vis-foreground .vis-item')]
+        .filter(item => isElementVisible(item));
+}
+
+// Returns the segments belonging to the same speaker as `item`, sorted in
+// chronological (left-to-right) order, plus the index of `item` within that
+// list. Speaker grouping mirrors getSpeakerNumbersForTimelineItems() so this
+// stays consistent with the rest of the extension's speaker-detection logic.
+function getSameSpeakerSegmentSiblings(item) {
+    if (!item) return { siblings: [], index: -1 };
+
+    const group = item.closest('.vis-group');
+    let itemsInGroup;
+
+    if (group) {
+        itemsInGroup = [...group.querySelectorAll('.vis-item')].filter(isElementVisible);
+    } else {
+        // Flat/single-row layout fallback: use the same row-detection logic
+        // as getSpeakerNumbersForTimelineItems to figure out who is "same speaker".
+        const allItems = getAllTimelineItemsForNav();
+        const speakerMap = getSpeakerNumbersForTimelineItems(allItems);
+        const mySpeaker = speakerMap.get(item);
+        itemsInGroup = allItems.filter(candidate => speakerMap.get(candidate) === mySpeaker);
+    }
+
+    const sorted = itemsInGroup
+        .map(el => ({ el, sortKey: getTimelineItemSortKey(el) }))
+        .sort((a, b) => (a.sortKey.x - b.sortKey.x) || (a.sortKey.y - b.sortKey.y))
+        .map(entry => entry.el);
+
+    return { siblings: sorted, index: sorted.indexOf(item) };
+}
+
+function isClickableTimelineSegment(item) {
+    if (!item || !isElementVisible(item)) return false;
+    // A real, renderable segment has a content node and a non-zero hit area.
+    // Segments that are mid-render, placeholder, or otherwise not ready
+    // (which is what was crashing the page) fail this check and get skipped
+    // rather than force-clicked.
+    const content = item.querySelector && (item.querySelector('div.vis-item-content') || item.querySelector('.vis-item-content'));
+    if (!content) return false;
+    const rect = item.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+// Hammer.js (used internally by vis-timeline for pan/zoom gestures) tracks
+// active pointers by pointerId. Each synthetic pointer we dispatch must use
+// an id that real pointers will never use, and EVERY pointerdown must be
+// followed by a matching pointerup — otherwise Hammer is left thinking a
+// pointer is still down, and the next real drag gets seen as a second
+// simultaneous pointer, which Hammer interprets as a pinch gesture (zoom)
+// instead of a pan (drag).
+let lbhSyntheticPointerIdCounter = 1000000;
+
+function dispatchSimulatedPointerOrMouseEvent(target, type, options) {
+    if (typeof PointerEvent === 'function') {
+        target.dispatchEvent(new PointerEvent(type, options));
+    } else {
+        target.dispatchEvent(new MouseEvent(type, options));
+    }
+}
+
+function dispatchSimulatedTimelineClick(target) {
+    if (!target) return false;
+    if (!isClickableTimelineSegment(target)) return false;
+
+    const rect = target.getBoundingClientRect();
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+    const pointerId = ++lbhSyntheticPointerIdCounter;
+
+    const baseOptions = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX,
+        clientY,
+        button: 0,
+        buttons: 1
+    };
+    const pointerOptions = {
+        ...baseOptions,
+        pointerId,
+        pointerType: 'mouse',
+        isPrimary: true
+    };
+
+    try {
+        dispatchSimulatedPointerOrMouseEvent(target, 'pointerdown', pointerOptions);
+        target.dispatchEvent(new MouseEvent('mousedown', baseOptions));
+        // Always pair pointerdown with pointerup, even if something above
+        // throws, so Hammer.js never keeps a phantom pointer "active" —
+        // that phantom state is what later turns a real drag into a
+        // pinch-zoom gesture.
+        dispatchSimulatedPointerOrMouseEvent(target, 'pointerup', { ...pointerOptions, buttons: 0 });
+        target.dispatchEvent(new MouseEvent('mouseup', { ...baseOptions, buttons: 0 }));
+        target.dispatchEvent(new MouseEvent('click', { ...baseOptions, buttons: 0 }));
+        return true;
+    } catch (_) {
+        // Defensive: never let a misbehaving target (e.g. one Labelbox is
+        // still rendering, with no editable surface yet) crash the page.
+        // Still make sure pointerup fires so we don't leak a phantom pointer.
+        try { dispatchSimulatedPointerOrMouseEvent(target, 'pointerup', { ...pointerOptions, buttons: 0 }); } catch (__) {}
+        return false;
+    }
+}
+
+function navigateToSameSpeakerSegment(direction) {
+    const currentItem = getCurrentlySelectedTimelineItem();
+    if (!currentItem) return false;
+
+    const { siblings, index } = getSameSpeakerSegmentSiblings(currentItem);
+    if (index < 0 || siblings.length < 2) return false;
+
+    // Walk outward from the adjacent index, skipping over any segment that
+    // isn't safely clickable (e.g. has no rendered content yet), instead of
+    // forcing a click on it and risking a crash.
+    let targetIndex = index + direction;
+    while (targetIndex >= 0 && targetIndex < siblings.length) {
+        const target = siblings[targetIndex];
+        if (target && target !== currentItem && isClickableTimelineSegment(target)) {
+            return dispatchSimulatedTimelineClick(target);
+        }
+        targetIndex += direction;
+    }
+    return false;
+}
+
+function isInsideTranscriptEditingContext(target) {
+    // True while focus is on the transcript segment's text (either the
+    // native vis-item-content display, or the classification textarea that
+    // Labelbox opens for the selected segment). We intentionally do NOT
+    // fall back to "a segment is selected somewhere on the page" — that
+    // would hijack Tab/Arrow even while typing in an unrelated field.
+    if (isTranscriptTextarea(target)) return true;
+    if (target && target.closest && target.closest('div.vis-item-content')) return true;
+    return false;
+}
+
+function handleSameSpeakerSegmentNavKeydown(e) {
+    if (e.key === 'Tab') {
+        // Only suppress Tab's default focus-jump while we're actually in a
+        // transcript editing context, so the rest of the page keeps normal
+        // Tab behavior.
+        if (isInsideTranscriptEditingContext(e.target)) {
+            lbhTabHeldForSegmentNav = true;
+            e.preventDefault();
+        }
+        return;
+    }
+
+    if (!lbhTabHeldForSegmentNav) return;
+
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+        if (e.repeat) {
+            // Swallow auto-repeat while held so we don't fire a burst of
+            // simulated clicks that can race Labelbox's own re-render.
+            if (isInsideTranscriptEditingContext(e.target)) e.preventDefault();
+            return;
+        }
+        if (!isInsideTranscriptEditingContext(e.target)) return;
+        const direction = e.key === 'ArrowRight' ? 1 : -1;
+        const moved = navigateToSameSpeakerSegment(direction);
+        if (moved) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    }
+    // ArrowUp / ArrowDown intentionally ignored.
+}
+
+function handleSameSpeakerSegmentNavKeyup(e) {
+    if (e.key === 'Tab') {
+        lbhTabHeldForSegmentNav = false;
+    }
+}
+
+document.addEventListener('keydown', handleSameSpeakerSegmentNavKeydown, true);
+document.addEventListener('keyup', handleSameSpeakerSegmentNavKeyup, true);
+// If focus leaves the page/window while Tab is held (e.g. alt-tabbing away),
+// make sure we don't get stuck thinking Tab is still down.
+window.addEventListener('blur', () => { lbhTabHeldForSegmentNav = false; });
+
 // Keep our widget controls responsive even when Labelbox registers broad click handlers.
 document.addEventListener('pointerdown', handleWidgetActionPress, true);
 document.addEventListener('mousedown', handleWidgetActionPress, true);
